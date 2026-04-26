@@ -87,30 +87,50 @@ def now_sa():
 # جلب البيانات
 # ══════════════════════════════════════════════════════════════
 
-def fetch_all_usdt(min_vol=1_000_000) -> list:
-    """جلب كل رموز USDT مع حجم > min_vol."""
-    r = api_get(f"https://api.binance.com/api/v3/ticker/24hr", timeout=(10, 25))
-    if not r or r.status_code != 200:
-        return []
+def fetch_all_usdt(min_vol=0) -> list:
+    """
+    جلب كل عملات Futures USDT من Binance بدون أي فلتر.
+    يشمل كل العملات المتاحة في السوق الآجلة.
+    """
+    futures_data = None
+    for url in [
+        f"{BASE}/fapi/v1/ticker/24hr",
+        "https://fapi.binance.com/fapi/v1/ticker/24hr",
+    ]:
+        r = api_get(url, timeout=(15, 40))
+        if r and r.status_code == 200:
+            futures_data = r.json()
+            break
+
+    # Spot كـ fallback
+    if not futures_data:
+        r2 = api_get("https://api.binance.com/api/v3/ticker/24hr", timeout=(15, 40))
+        if r2 and r2.status_code == 200:
+            futures_data = r2.json()
+
+    data = futures_data or []
     result = []
-    for t in r.json():
+
+    for t in data:
         sym = t.get("symbol", "")
+        # فقط USDT وليس Stable Coins
         if not sym.endswith("USDT") or sym in EXCLUDED:
             continue
         try:
-            vol = float(t.get("quoteVolume", 0))
-            if vol >= min_vol:
-                result.append({
-                    "sym":     sym,
-                    "price":   float(t.get("lastPrice", 0)),
-                    "chg_24h": float(t.get("priceChangePercent", 0)),
-                    "vol_24h": vol,
-                    "high_24": float(t.get("highPrice", 0)),
-                    "low_24":  float(t.get("lowPrice", 0)),
-                })
+            result.append({
+                "sym":     sym,
+                "price":   float(t.get("lastPrice", 0) or 0),
+                "chg_24h": float(t.get("priceChangePercent", 0) or 0),
+                "vol_24h": float(t.get("quoteVolume", 0) or 0),
+                "high_24": float(t.get("highPrice", 0) or 0),
+                "low_24":  float(t.get("lowPrice", 0) or 0),
+            })
         except:
             continue
-    result.sort(key=lambda x: x["vol_24h"], reverse=True)
+
+    # رتّب حسب التغيير المطلق (الأكثر حركة أولاً)
+    result.sort(key=lambda x: abs(x["chg_24h"]), reverse=True)
+    logging.warning(f"[FETCH] {len(result)} عملة Futures USDT")
     return result
 
 
@@ -547,26 +567,24 @@ async def scanner_job(ctx: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_event_loop()
 
         def do_scan():
-            coins  = fetch_all_usdt(min_vol=2_000_000)[:120]
+            coins  = fetch_all_usdt(min_vol=500_000)
             alerts = []
             for meta in coins:
                 sym = meta["sym"]
-                # تخطي إذا عندنا صفقة مفتوحة أو تنبهنا مؤخراً
-                in_trade = sym in active_trades.get(chat_id, {})
-                in_cooldown = now_ts - last_alert.get(chat_id, {}).get(sym, 0) < cooldown
-                if in_trade or in_cooldown:
-                    continue
+                in_trade    = sym in active_trades.get(chat_id, {})
+                in_cooldown = now_ts - last_alert.get(chat_id,{}).get(sym,0) < cooldown
+                if in_trade or in_cooldown: continue
+
                 try:
                     r = analyze_coin(sym, meta)
                     if r["score"] >= min_score and r["phase"] != "none":
                         alerts.append(r)
-                except:
-                    continue
+                except: continue
             alerts.sort(key=lambda x: x["score"], reverse=True)
             return alerts
 
         alerts = await asyncio.wait_for(
-            loop.run_in_executor(None, do_scan), timeout=240)
+            loop.run_in_executor(None, do_scan), timeout=480)
 
         last_results[chat_id] = alerts
 
@@ -716,7 +734,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🚨 *تم تفعيل كاشف الانفجار*\n\n"
             f"⏱ مسح كل 5 دقائق\n"
             f"🎯 حد النقاط: `{min_sc}/100`\n"
-            f"📊 يراقب أعلى 120 عملة حجماً\n"
+            f"📊 يراقب كل عملات Binance Futures (بلا حد)\n"
             f"👁 مراقبة الصفقات كل دقيقتين\n\n"
             f"سيرسل تنبيه فور اكتشاف:\n"
             f"• انفجار مبكر\n"
