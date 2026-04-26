@@ -587,6 +587,7 @@ async def scanner_job(ctx: ContextTypes.DEFAULT_TYPE):
             loop.run_in_executor(None, do_scan), timeout=480)
 
         last_results[chat_id] = alerts
+        logging.warning(f"[SCAN] وجد {len(alerts)} إشارة من أصل {len(fetch_all_usdt()[:1])} عملة")
 
         for i, r in enumerate(alerts[:3], 1):
             sym = r["sym"]
@@ -694,6 +695,53 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 
+async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """اختبار سريع على أكثر 10 عملات حركةً الآن."""
+    chat_id = u.effective_chat.id
+    wait = await u.message.reply_text(
+        "🔍 اختبار سريع — أكثر 10 عملات حركةً الآن...",
+        parse_mode="Markdown")
+    loop = asyncio.get_event_loop()
+
+    def quick_test():
+        coins = fetch_all_usdt()[:10]  # أكثر 10 بحركة
+        results = []
+        for meta in coins:
+            try:
+                r = analyze_coin(meta["sym"], meta)
+                results.append(r)
+            except Exception as e:
+                results.append({"sym": meta["sym"], "score": 0,
+                                 "phase": "error", "signals": [str(e)[:50]],
+                                 "price": meta.get("price",0), "chg_24h": meta.get("chg_24h",0)})
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results
+
+    try:
+        results = await asyncio.wait_for(
+            loop.run_in_executor(None, quick_test), timeout=120)
+        last_results[chat_id] = results
+        await wait.delete()
+
+        m = "✅ *نتائج الاختبار السريع:*\n\n"
+        for i, r in enumerate(results, 1):
+            phase_txt = PHASE_LABELS.get(r["phase"], r["phase"])
+            bar = "█"*int(r["score"]/10) + "░"*(10-int(r["score"]/10))
+            m += f"*{i}. {r['sym']}* `{r['score']}/100`\n"
+            m += f"   💰 `${fmt(r['price'])}` | 24h: `{r['chg_24h']:+.1f}%`\n"
+            m += f"   `{bar}`\n"
+            for s in r["signals"][:2]: m += f"   {s}\n"
+            m += "\n"
+        if not any(r["score"] > 0 for r in results):
+            m += "_لا توجد إشارات انفجار الآن — السوق هادئ_\n"
+        m += "\n`كاشف` للمسح الكامل كل 5 دقائق"
+        await u.message.reply_text(m, parse_mode="Markdown")
+    except asyncio.TimeoutError:
+        await wait.edit_text("❌ انتهى الوقت — جرب مرة أخرى")
+    except Exception as e:
+        await wait.edit_text(f"❌ {str(e)[:100]}")
+
+
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text    = u.message.text.strip()
     chat_id = u.effective_chat.id
@@ -755,6 +803,11 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "الصفقات المفتوحة لا تزال قيد المراقبة حتى تُغلقها.\n"
             "إعادة تفعيل: `كاشف`",
             parse_mode="Markdown")
+        return
+
+    # ── اختبار سريع ──
+    if text in ("اختبار","test","تجربة"):
+        await cmd_test(u, c)
         return
 
     # ── نتائج ──
@@ -850,6 +903,7 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("test",  cmd_test))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
 
