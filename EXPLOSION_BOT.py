@@ -846,6 +846,614 @@ def detect_pre_explosion(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
+# 🆕 SMART GRID TRADING SYSTEM
+# ══════════════════════════════════════════════════════════════
+# نظام Grid ذكي يفحص العملات ويكتشف الفرص المثالية للـ Grid
+# يدعم وضعين: تلقائي (ماسح) ويدوي (لعملة محددة)
+# ══════════════════════════════════════════════════════════════
+
+# State for Grid System
+active_grids: dict = {}              # {chat_id: {sym: grid_data}}
+grid_history: dict = {}              # {chat_id: {sym: [trades]}}
+grid_scan_alerted: dict = {}         # {chat_id: {sym: ts}} للتبريد
+last_grid_results: dict = {}         # {chat_id: [candidates]}
+GRID_SCAN_COOL = 7200               # ساعتين بين تنبيهات نفس العملة
+
+
+def analyze_grid_suitability(sym: str, df_5m: pd.DataFrame = None,
+                              meta: dict = None) -> dict:
+    """
+    🎯 تحليل مدى مناسبة عملة لـ Grid Trading.
+    يعتمد على 5 معايير وزنية لإعطاء score من 0-100.
+    """
+    result = {
+        "sym":           sym,
+        "score":         0,
+        "suitable":      False,
+        "level":         "غير مناسب",
+        "details":       [],
+        "warnings":      [],
+        "atr_pct":       0,
+        "trend":         "unknown",
+        "volume_24h":    0,
+        "current_price": 0,
+        "range_high":    0,
+        "range_low":     0,
+        "range_pct":     0,
+        "bounces":       0,
+        "stable_days":   0,
+    }
+
+    try:
+        # جلب بيانات إذا لم تُرسَل
+        if df_5m is None:
+            df_5m = fetch_klines(sym, "5m", 288)  # يومين
+        if df_5m is None or len(df_5m) < 100:
+            result["warnings"].append("بيانات غير كافية")
+            return result
+
+        # السعر الحالي
+        current_price = float(df_5m["c"].iloc[-1])
+        result["current_price"] = current_price
+        if current_price <= 0:
+            return result
+
+        # ════════════════════════════════════════
+        # 1️⃣ التقلب (ATR) — 25 نقطة
+        # ════════════════════════════════════════
+        h = df_5m["h"]
+        l = df_5m["l"]
+        c = df_5m["c"]
+        tr = pd.concat([
+            h - l,
+            (h - c.shift()).abs(),
+            (l - c.shift()).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        atr_pct = (atr / current_price) * 100
+        result["atr_pct"] = atr_pct
+
+        atr_score = 0
+        if 2.0 <= atr_pct <= 6.0:
+            atr_score = 25
+            result["details"].append(f"✅ تقلب مثالي ({atr_pct:.2f}%)")
+        elif 1.5 <= atr_pct <= 8.0:
+            atr_score = 18
+            result["details"].append(f"🟡 تقلب جيد ({atr_pct:.2f}%)")
+        elif 1.0 <= atr_pct <= 10.0:
+            atr_score = 10
+            result["details"].append(f"⚠️ تقلب مقبول ({atr_pct:.2f}%)")
+        elif atr_pct < 1.0:
+            atr_score = 0
+            result["warnings"].append(f"تقلب ضعيف جداً ({atr_pct:.2f}%) — راكد")
+        else:  # > 10%
+            atr_score = 0
+            result["warnings"].append(f"تقلب مرتفع جداً ({atr_pct:.2f}%) — خطر")
+
+        # ════════════════════════════════════════
+        # 2️⃣ عدم وجود Trend (EMA Slope) — 25 نقطة
+        # ════════════════════════════════════════
+        ema21 = c.ewm(span=21).mean()
+        ema50 = c.ewm(span=50).mean()
+
+        # ميل EMA21 على آخر 50 شمعة
+        ema_now = float(ema21.iloc[-1])
+        ema_50ago = float(ema21.iloc[-50])
+        slope_pct = ((ema_now - ema_50ago) / ema_50ago) * 100
+
+        # علاقة EMA21 و EMA50
+        ema_diff = abs(float(ema21.iloc[-1]) - float(ema50.iloc[-1])) / current_price * 100
+
+        trend_score = 0
+        if abs(slope_pct) < 1.0 and ema_diff < 1.0:
+            trend_score = 25
+            result["trend"] = "sideways_strong"
+            result["details"].append(f"✅ سوق جانبي قوي (ميل {slope_pct:+.2f}%)")
+        elif abs(slope_pct) < 2.0 and ema_diff < 2.0:
+            trend_score = 18
+            result["trend"] = "sideways"
+            result["details"].append(f"🟡 سوق جانبي (ميل {slope_pct:+.2f}%)")
+        elif abs(slope_pct) < 3.5:
+            trend_score = 8
+            result["trend"] = "weak_trend"
+            result["details"].append(f"⚠️ trend ضعيف (ميل {slope_pct:+.2f}%)")
+        else:
+            trend_score = 0
+            result["trend"] = "trending"
+            direction = "صاعد" if slope_pct > 0 else "هابط"
+            result["warnings"].append(f"trend {direction} قوي ({slope_pct:+.2f}%) — Grid غير مناسب")
+
+        # ════════════════════════════════════════
+        # 3️⃣ حجم التداول — 15 نقطة
+        # ════════════════════════════════════════
+        vol_24h = 0
+        if meta:
+            vol_24h = meta.get("vol_24h", 0)
+        if vol_24h == 0:
+            # حساب من الكلاينز (تقريبي)
+            vol_24h = float(df_5m["qv"].iloc[-288:].sum()) if len(df_5m) >= 288 else \
+                      float(df_5m["qv"].sum())
+        result["volume_24h"] = vol_24h
+
+        vol_score = 0
+        if vol_24h >= 100_000_000:        # ≥$100M
+            vol_score = 15
+            result["details"].append(f"✅ سيولة ممتازة (${vol_24h/1e6:.1f}M)")
+        elif vol_24h >= 30_000_000:       # ≥$30M
+            vol_score = 12
+            result["details"].append(f"🟡 سيولة جيدة (${vol_24h/1e6:.1f}M)")
+        elif vol_24h >= 10_000_000:       # ≥$10M
+            vol_score = 8
+            result["details"].append(f"⚠️ سيولة مقبولة (${vol_24h/1e6:.1f}M)")
+        elif vol_24h >= 3_000_000:        # ≥$3M
+            vol_score = 4
+        else:
+            vol_score = 0
+            result["warnings"].append(f"سيولة ضعيفة (${vol_24h/1e6:.1f}M)")
+
+        # ════════════════════════════════════════
+        # 4️⃣ Range Stability — 20 نقطة
+        # ════════════════════════════════════════
+        # نطاق آخر 200 شمعة (16 ساعة)
+        recent = df_5m.iloc[-200:]
+        range_high = float(recent["h"].max())
+        range_low = float(recent["l"].min())
+        range_pct = ((range_high - range_low) / current_price) * 100
+        result["range_high"] = range_high
+        result["range_low"] = range_low
+        result["range_pct"] = range_pct
+
+        # كم شمعة كانت داخل النطاق الأساسي (50% الأوسط)
+        mid = (range_high + range_low) / 2
+        band_size = (range_high - range_low) * 0.5
+        in_band = recent[(recent["c"] >= mid - band_size/2) &
+                         (recent["c"] <= mid + band_size/2)]
+        in_band_pct = (len(in_band) / len(recent)) * 100
+
+        range_score = 0
+        if 3.0 <= range_pct <= 8.0 and in_band_pct >= 40:
+            range_score = 20
+            result["details"].append(f"✅ نطاق ثابت ({range_pct:.1f}% — {in_band_pct:.0f}% داخله)")
+        elif 2.0 <= range_pct <= 12.0 and in_band_pct >= 30:
+            range_score = 14
+            result["details"].append(f"🟡 نطاق جيد ({range_pct:.1f}%)")
+        elif range_pct < 2.0:
+            range_score = 5
+            result["warnings"].append(f"النطاق ضيق جداً ({range_pct:.1f}%)")
+        elif range_pct > 15.0:
+            range_score = 0
+            result["warnings"].append(f"النطاق واسع جداً ({range_pct:.1f}%) — لا يوجد range واضح")
+        else:
+            range_score = 8
+
+        # ════════════════════════════════════════
+        # 5️⃣ Bounce Quality — 15 نقطة
+        # ════════════════════════════════════════
+        # كم مرة لمس السعر الحدود (Range tests)
+        upper_tests = 0
+        lower_tests = 0
+        upper_threshold = range_high - (range_high - range_low) * 0.15
+        lower_threshold = range_low + (range_high - range_low) * 0.15
+
+        for i in range(0, len(recent) - 5, 5):
+            window = recent.iloc[i:i+5]
+            if window["h"].max() >= upper_threshold:
+                upper_tests += 1
+            if window["l"].min() <= lower_threshold:
+                lower_tests += 1
+        bounces = upper_tests + lower_tests
+        result["bounces"] = bounces
+
+        bounce_score = 0
+        if bounces >= 8:
+            bounce_score = 15
+            result["details"].append(f"✅ ارتدادات قوية ({upper_tests} علوي / {lower_tests} سفلي)")
+        elif bounces >= 5:
+            bounce_score = 11
+            result["details"].append(f"🟡 ارتدادات جيدة ({upper_tests}/{lower_tests})")
+        elif bounces >= 3:
+            bounce_score = 6
+        else:
+            bounce_score = 0
+            result["warnings"].append(f"ارتدادات قليلة ({bounces}) — احتمال كسر النطاق")
+
+        # ════════════════════════════════════════
+        # تجميع النتيجة
+        # ════════════════════════════════════════
+        total_score = atr_score + trend_score + vol_score + range_score + bounce_score
+        result["score"] = total_score
+
+        if total_score >= 85:
+            result["level"] = "🥇 ممتاز"
+            result["suitable"] = True
+        elif total_score >= 70:
+            result["level"] = "🥈 جيد جداً"
+            result["suitable"] = True
+        elif total_score >= 55:
+            result["level"] = "🥉 مقبول"
+            result["suitable"] = True
+        elif total_score >= 40:
+            result["level"] = "⚠️ حذر"
+            result["suitable"] = False
+        else:
+            result["level"] = "❌ غير مناسب"
+            result["suitable"] = False
+
+        # حساب stable_days تقريبياً
+        result["stable_days"] = round(in_band_pct / 25, 1)  # تقريب
+
+    except Exception as e:
+        logging.warning(f"[GRID_ANALYZE] {sym}: {e}")
+    return result
+
+
+def calculate_grid_levels(price: float, range_high: float, range_low: float,
+                           levels: int = 10) -> dict:
+    """
+    🧮 حساب مستويات الـ Grid بناءً على النطاق المكتشف.
+    """
+    spacing = (range_high - range_low) / levels
+    half = levels // 2
+
+    buy_levels = []
+    sell_levels = []
+
+    # مستويات الشراء (تحت السعر الحالي حتى range_low)
+    buy_step = (price - range_low) / max(half, 1)
+    for i in range(1, half + 1):
+        level_price = price - (buy_step * i)
+        if level_price > range_low * 0.99:
+            buy_levels.append({
+                "level":    i,
+                "type":     "BUY",
+                "price":    round(level_price, 8),
+                "distance": -((price - level_price) / price * 100),
+                "filled":   False,
+            })
+
+    # مستويات البيع (فوق السعر الحالي حتى range_high)
+    sell_step = (range_high - price) / max(half, 1)
+    for i in range(1, half + 1):
+        level_price = price + (sell_step * i)
+        if level_price < range_high * 1.01:
+            sell_levels.append({
+                "level":    i,
+                "type":     "SELL",
+                "price":    round(level_price, 8),
+                "distance": ((level_price - price) / price * 100),
+                "filled":   False,
+            })
+
+    return {
+        "current_price":  price,
+        "range_high":     range_high,
+        "range_low":      range_low,
+        "spacing":        spacing,
+        "spacing_pct":    (spacing / price) * 100,
+        "buy_levels":     buy_levels,
+        "sell_levels":    sell_levels,
+        "expected_profit_per_cycle": (spacing / price) * 100,
+    }
+
+
+def fetch_current_price(sym: str) -> float:
+    """جلب سعر العملة الحالي."""
+    try:
+        for url in [f"{BASE}/fapi/v1/ticker/price",
+                    "https://api.binance.com/api/v3/ticker/price"]:
+            r = api_get(url, {"symbol": sym}, timeout=(4, 8))
+            if r and r.status_code == 200:
+                return float(r.json().get("price", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def scan_grid_opportunities(min_score: int = 60, max_results: int = 10) -> list:
+    """
+    🔍 يفحص كل عملات Binance Futures ويرجع أفضل المرشحين للـ Grid.
+    """
+    candidates = []
+    try:
+        coins = fetch_all_usdt(min_vol=10_000_000)  # حد سيولة $10M
+        if not coins:
+            return []
+
+        # نأخذ أعلى 100 عملة بالحجم
+        coins.sort(key=lambda x: x.get("vol_24h", 0), reverse=True)
+        coins = coins[:100]
+
+        for meta in coins:
+            sym = meta["sym"]
+            try:
+                analysis = analyze_grid_suitability(sym, meta=meta)
+                if analysis["score"] >= min_score:
+                    # حساب مستويات الـ Grid
+                    grid = calculate_grid_levels(
+                        analysis["current_price"],
+                        analysis["range_high"],
+                        analysis["range_low"],
+                        levels=10,
+                    )
+                    analysis["grid"] = grid
+                    candidates.append(analysis)
+            except Exception:
+                continue
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:max_results]
+    except Exception as e:
+        logging.warning(f"[GRID_SCAN] {e}")
+        return []
+
+
+def build_grid_scanner_alert(candidates: list, max_show: int = 3) -> str:
+    """بناء رسالة تنبيه ماسح الـ Grid."""
+    if not candidates:
+        return ("🔍 *ماسح Grid*\n\n"
+                "⚠️ لم يتم اكتشاف فرص Grid مناسبة الآن.\n\n"
+                "💡 الأسباب المحتملة:\n"
+                "  • السوق في trend قوي (صاعد/هابط)\n"
+                "  • التقلب منخفض جداً\n"
+                "  • السيولة ضعيفة\n\n"
+                "🔄 سيُعاد الفحص لاحقاً.")
+
+    n = min(len(candidates), max_show)
+    msg = f"🎯 *فرص Grid مكتشفة ({n} عملة)*\n"
+    msg += f"🕐 {now_sa()}\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    medals = ["🥇", "🥈", "🥉"]
+    for i, c in enumerate(candidates[:n]):
+        medal = medals[i] if i < 3 else f"#{i+1}"
+        sym = c["sym"]
+        score = c["score"]
+        level = c["level"]
+        price = c["current_price"]
+        atr_pct = c["atr_pct"]
+        vol_m = c["volume_24h"] / 1_000_000
+        grid = c.get("grid", {})
+
+        msg += f"{medal} *{sym}* — Score: `{score}/100`\n"
+        msg += f"  {level}\n"
+        msg += f"  💰 السعر: `${fmt(price)}`\n"
+        msg += f"  📊 التقلب: `{atr_pct:.2f}%`\n"
+        msg += f"  💧 الحجم: `${vol_m:,.1f}M`\n"
+
+        if grid.get("range_high"):
+            msg += "\n  🟢 *نطاق Grid:*\n"
+            msg += f"    أعلى: `${fmt(grid['range_high'])}` (+{((grid['range_high']-price)/price*100):+.1f}%)\n"
+            msg += f"    أوسط: `${fmt(price)}`\n"
+            msg += f"    أسفل: `${fmt(grid['range_low'])}` ({((grid['range_low']-price)/price*100):+.1f}%)\n"
+
+            buy_levels = grid.get("buy_levels", [])
+            sell_levels = grid.get("sell_levels", [])
+
+            if buy_levels:
+                first_buy = buy_levels[0]
+                msg += f"\n  🎯 *خطة الدخول الأولى:*\n"
+                msg += f"    اشتري عند: `${fmt(first_buy['price'])}` ({first_buy['distance']:+.2f}%)\n"
+                if sell_levels:
+                    first_sell = sell_levels[0]
+                    msg += f"    بِع عند:    `${fmt(first_sell['price'])}` (+{first_sell['distance']:.2f}%)\n"
+                    profit_pct = grid.get("expected_profit_per_cycle", 0)
+                    msg += f"    الربح/دورة: ~`{profit_pct:.2f}%`\n"
+
+        if c.get("warnings"):
+            msg += "\n  ⚠️ تحذيرات:\n"
+            for w in c["warnings"][:2]:
+                msg += f"    • {w}\n"
+
+        msg += "\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    msg += "💡 *للتفعيل اليدوي:*\n"
+    if candidates:
+        msg += f"  `جريد {candidates[0]['sym'][:-4]}` — تفعيل أفضل عملة\n"
+    msg += "  `جريداتي` — عرض الـ Grids النشطة\n"
+    msg += "\n⚠️ _تنفيذ يدوي — للأغراض التعليمية فقط_"
+    return msg
+
+
+def build_grid_status(grid_data: dict) -> str:
+    """عرض حالة Grid معينة."""
+    sym = grid_data.get("sym", "?")
+    grid = grid_data.get("grid", {})
+    history = grid_data.get("history", [])
+
+    msg = f"📊 *Grid: {sym}*\n"
+    msg += f"🕐 {now_sa()}\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    current = fetch_current_price(sym)
+    msg += f"💰 السعر الآن: `${fmt(current)}`\n"
+    msg += f"📍 المركز: `${fmt(grid_data.get('center_price', 0))}`\n"
+    msg += f"📏 النطاق: `${fmt(grid.get('range_low', 0))}` - `${fmt(grid.get('range_high', 0))}`\n\n"
+
+    # حالة المستويات
+    buy_levels = grid.get("buy_levels", [])
+    sell_levels = grid.get("sell_levels", [])
+
+    filled_buys = sum(1 for b in buy_levels if b.get("filled"))
+    filled_sells = sum(1 for s in sell_levels if s.get("filled"))
+
+    msg += f"🟢 مستويات الشراء: {filled_buys}/{len(buy_levels)}\n"
+    for b in buy_levels:
+        icon = "✅" if b.get("filled") else "⭕"
+        msg += f"  {icon} #{b['level']}: `${fmt(b['price'])}` ({b['distance']:+.2f}%)\n"
+
+    msg += f"\n🔴 مستويات البيع: {filled_sells}/{len(sell_levels)}\n"
+    for s in sell_levels:
+        icon = "✅" if s.get("filled") else "⭕"
+        msg += f"  {icon} #{s['level']}: `${fmt(s['price'])}` ({s['distance']:+.2f}%)\n"
+
+    # P&L
+    if history:
+        completed_cycles = len([h for h in history if h.get("type") == "cycle_complete"])
+        total_profit = sum(h.get("profit", 0) for h in history)
+        msg += f"\n💵 *الأداء:*\n"
+        msg += f"  دورات مكتملة: `{completed_cycles}`\n"
+        msg += f"  P&L افتراضي: `{total_profit:+.2f}%`\n"
+
+    # تحذير لو خرج النطاق
+    range_high = grid.get("range_high", 0)
+    range_low = grid.get("range_low", 0)
+    if current > range_high * 1.02:
+        msg += f"\n⚠️ *تحذير:* السعر خرج فوق النطاق!"
+    elif current < range_low * 0.98:
+        msg += f"\n⚠️ *تحذير:* السعر خرج تحت النطاق!"
+
+    return msg
+
+
+async def grid_scanner_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """مهمة فحص فرص Grid كل ساعة."""
+    chat_id = ctx.job.data["chat_id"]
+    min_score = ctx.job.data.get("min_score", 70)
+
+    try:
+        loop = asyncio.get_event_loop()
+        candidates = await asyncio.wait_for(
+            loop.run_in_executor(None, scan_grid_opportunities, min_score, 10),
+            timeout=300,
+        )
+        last_grid_results[chat_id] = candidates
+
+        if not candidates:
+            logging.warning(f"[GRID_SCAN] لا فرص (min_score={min_score})")
+            return
+
+        logging.warning(f"[GRID_SCAN] وجد {len(candidates)} فرصة")
+
+        # cooldown: نرسل فقط لو فيه عملة جديدة
+        now_ts = time.time()
+        new_candidates = []
+        for c in candidates[:3]:
+            sym = c["sym"]
+            last_alert = grid_scan_alerted.get(chat_id, {}).get(sym, 0)
+            if now_ts - last_alert >= GRID_SCAN_COOL:
+                new_candidates.append(c)
+                grid_scan_alerted.setdefault(chat_id, {})[sym] = now_ts
+
+        if not new_candidates:
+            return
+
+        msg = build_grid_scanner_alert(new_candidates, max_show=3)
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📊 تفاصيل الكل", callback_data="grid:results"),
+                ]])
+            )
+        except Exception as e:
+            logging.warning(f"[GRID_SCAN_SEND] {e}")
+    except asyncio.TimeoutError:
+        logging.warning("[GRID_SCAN] timeout")
+    except Exception as e:
+        logging.warning(f"[GRID_SCAN] {e}")
+
+
+async def grid_monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """مراقبة الـ Grids النشطة وإرسال تنبيهات لمس المستويات."""
+    chat_id = ctx.job.data["chat_id"]
+    grids = active_grids.get(chat_id, {})
+    if not grids:
+        return
+
+    for sym, grid_data in list(grids.items()):
+        try:
+            current = fetch_current_price(sym)
+            if current <= 0:
+                continue
+
+            grid = grid_data.get("grid", {})
+            range_high = grid.get("range_high", 0)
+            range_low = grid.get("range_low", 0)
+
+            # تحذير من خروج النطاق
+            if current > range_high * 1.02 or current < range_low * 0.98:
+                if not grid_data.get("range_break_alerted"):
+                    direction = "فوق" if current > range_high else "تحت"
+                    msg = (f"⚠️ *تحذير: {sym} خرج النطاق*\n\n"
+                           f"💰 السعر الحالي: `${fmt(current)}`\n"
+                           f"📏 النطاق المحدد: `${fmt(range_low)}` - `${fmt(range_high)}`\n"
+                           f"🚨 السعر {direction} النطاق!\n\n"
+                           f"💡 توصية: راجع الـ Grid أو أوقفه\n"
+                           f"`وقف جريد {sym[:-4]}`")
+                    try:
+                        await ctx.bot.send_message(chat_id, msg, parse_mode="Markdown")
+                        grid_data["range_break_alerted"] = True
+                    except Exception:
+                        pass
+                continue
+
+            # فحص لمس مستويات الشراء
+            for buy in grid.get("buy_levels", []):
+                if buy.get("filled"):
+                    continue
+                # اعتبر "وصل" إذا السعر <= السعر المستهدف
+                if current <= buy["price"]:
+                    buy["filled"] = True
+                    buy["filled_at"] = time.time()
+                    grid_data.setdefault("history", []).append({
+                        "type":  "buy_hit",
+                        "level": buy["level"],
+                        "price": buy["price"],
+                        "ts":    time.time(),
+                    })
+                    # إرسال تنبيه
+                    msg = (f"🟢 *إشارة Grid: {sym}*\n"
+                           f"💰 وصل مستوى الشراء #{buy['level']}\n\n"
+                           f"السعر الحالي: `${fmt(current)}`\n"
+                           f"المستوى: `${fmt(buy['price'])}`\n"
+                           f"المسافة: `{buy['distance']:+.2f}%`\n\n"
+                           f"💡 *توصية يدوية:*\n"
+                           f"  اشتري على Binance/OKX\n")
+                    # السعر المستهدف للبيع = أول مستوى بيع متاح
+                    next_sell = next((s for s in grid["sell_levels"] if not s.get("filled")), None)
+                    if next_sell:
+                        profit_pct = ((next_sell["price"] - buy["price"]) / buy["price"]) * 100
+                        msg += (f"  هدف البيع: `${fmt(next_sell['price'])}`\n"
+                                f"  الربح المتوقع: `+{profit_pct:.2f}%`\n")
+                    msg += "\n⚠️ _تنفيذ يدوي فقط_"
+                    try:
+                        await ctx.bot.send_message(chat_id, msg, parse_mode="Markdown")
+                    except Exception as e:
+                        logging.warning(f"[GRID_BUY] {e}")
+
+            # فحص لمس مستويات البيع
+            for sell in grid.get("sell_levels", []):
+                if sell.get("filled"):
+                    continue
+                if current >= sell["price"]:
+                    sell["filled"] = True
+                    sell["filled_at"] = time.time()
+                    grid_data.setdefault("history", []).append({
+                        "type":  "sell_hit",
+                        "level": sell["level"],
+                        "price": sell["price"],
+                        "ts":    time.time(),
+                    })
+                    msg = (f"🔴 *إشارة Grid: {sym}*\n"
+                           f"💰 وصل مستوى البيع #{sell['level']}\n\n"
+                           f"السعر الحالي: `${fmt(current)}`\n"
+                           f"المستوى: `${fmt(sell['price'])}`\n"
+                           f"المسافة: `{sell['distance']:+.2f}%`\n\n"
+                           f"💡 *توصية يدوية:*\n"
+                           f"  بِع على Binance/OKX (لو كنت اشتريت من قبل)\n\n"
+                           f"⚠️ _تنفيذ يدوي فقط_")
+                    try:
+                        await ctx.bot.send_message(chat_id, msg, parse_mode="Markdown")
+                    except Exception as e:
+                        logging.warning(f"[GRID_SELL] {e}")
+
+        except Exception as e:
+            logging.warning(f"[GRID_MON] {sym}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
 # محرك الكشف
 # ══════════════════════════════════════════════════════════════
 
@@ -1598,39 +2206,49 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💥 *EXPLOSION DETECTOR BOT v2.1*\n"
-        "كاشف الانفجار السعري — *مع الكشف المبكر* 🌱\n\n"
+        "💥 *EXPLOSION DETECTOR BOT v3*\n"
+        "كاشف الانفجار + Smart Grid 🌱\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ *أوضاع الكاشف:*\n\n"
+        "🚨 *كاشف الانفجار:*\n\n"
         "🌱 `كاشف مبكر`     — *قبل الانفجار!* (تراكم) ⭐\n"
-        "🟢 `كاشف`           — تفعيل عادي (دقة ~55%)\n"
-        "⚖️ `كاشف متوازن`    — جودة معتدلة (~65%)\n"
-        "💎 `كاشف جودة`      — عالي الجودة (~75%)\n"
-        "👑 `كاشف ذهبي`      — النخبة فقط (~80%)\n\n"
-        "🔴 *إيقاف:* `وقف`\n\n"
-        "📊 *معلومات:*\n"
-        "`نتائج`    — آخر عمليات الرصد\n"
-        "`صفقاتي`   — الصفقات المفتوحة\n"
-        "`btc`       — حالة BTC الآن\n\n"
+        "🟢 `كاشف`           — عادي (دقة ~55%)\n"
+        "⚖️ `كاشف متوازن`    — معتدلة (~65%)\n"
+        "💎 `كاشف جودة`      — عالية (~75%)\n"
+        "👑 `كاشف ذهبي`      — النخبة (~80%)\n"
+        "🔴 `وقف` — إيقاف الكاشف\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌱 *الكشف المبكر يبحث عن:*\n"
-        "  • حجم يتزايد تدريجياً (تراكم)\n"
-        "  • قيعان صاعدة (دعم قوي)\n"
-        "  • Bollinger ضيق نادر (انضغاط)\n"
-        "  • شراء صامت متزايد\n"
-        "  • EMA21 يتقوس صاعد\n"
-        "  • Bullish RSI Divergence\n\n"
-        "💡 *الكشف المبكر = إشارة قبل الحركة*\n"
-        "💡 *الكشف العادي = إشارة مع الحركة*\n\n"
+        "🎯 *Smart Grid Trading (جديد):*\n\n"
+        "🔍 `جريد ماسح`           — يكتشف فرص Grid فوراً\n"
+        "🔄 `جريد ماسح تلقائي`    — فحص دوري كل ساعة\n"
+        "📊 `جريد ماسح 80`        — فقط score ≥80\n"
+        "🟢 `جريد BTC`            — Grid يدوي\n"
+        "💪 `جريد BTC قسري`       — رغم عدم المناسبة\n"
+        "📋 `جريداتي`             — Grids النشطة\n"
+        "🔍 `جريد BTC حالة`       — تفاصيل Grid\n"
+        "🔴 `وقف جريد BTC`        — إيقاف Grid\n"
+        "🛑 `وقف كل الجريدات`     — إيقاف الكل\n"
+        "🛑 `وقف جريد ماسح`       — إيقاف الفحص الدوري\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🛡 *الفلاتر الذكية (7):*\n"
-        "  ① BTC Trend ② MTF ③ Order Book\n"
-        "  ④ Funding/OI ⑤ Sweep ⑥ Vol Quality\n"
-        "  ⑦ BTC Correlation\n\n"
-        "🔔 *تنبيه خروج تلقائي عند:*\n"
-        "• وصول SL • RSI ذروة\n"
-        "• CVD ينعكس • تراجع 3%+ من القمة\n\n"
-        "⚠️ _للأغراض التعليمية فقط_",
+        "📊 *معلومات عامة:*\n"
+        "`نتائج`        — آخر رصد للكاشف\n"
+        "`صفقاتي`       — الصفقات المفتوحة\n"
+        "`btc`           — حالة BTC الآن\n"
+        "`جريد نتائج`   — آخر فرص Grid\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 *Grid مناسب لما:*\n"
+        "  • السوق متذبذب (sideways)\n"
+        "  • التقلب 2-6%\n"
+        "  • السيولة ≥$10M\n"
+        "  • ارتدادات متعددة من الحدود\n\n"
+        "🎯 *Grid يفشل لما:*\n"
+        "  ❌ السوق في trend قوي\n"
+        "  ❌ التقلب منخفض جداً\n"
+        "  ❌ السعر يخرج النطاق\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🛡 *فلاتر ذكية (7) للكاشف:*\n"
+        "  BTC Trend / MTF / Order Book / Funding\n"
+        "  Sweep / Volume / BTC Correlation\n\n"
+        "⚠️ _تنفيذ يدوي — للأغراض التعليمية فقط_",
         parse_mode="Markdown")
 
 
@@ -1893,6 +2511,318 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(m, parse_mode="Markdown")
         return
 
+    # ══════════════════════════════════════════════════════════════
+    # 🆕 SMART GRID COMMANDS
+    # ══════════════════════════════════════════════════════════════
+
+    # ── ماسح الجريد (تلقائي/فوري) ──
+    if text.startswith("جريد ماسح") or text.lower() in ("grid scan", "scan grid"):
+        parts = text.split()
+        # تحقق من تلقائي
+        is_auto = any(p in ("تلقائي", "auto") for p in parts)
+        # تحقق من min_score
+        min_sc = 70
+        for p in parts:
+            try:
+                n = int(p)
+                if 40 <= n <= 95:
+                    min_sc = n
+            except ValueError:
+                pass
+
+        if is_auto:
+            # تفعيل الفحص التلقائي كل ساعة
+            jname = f"grid_scan_{chat_id}"
+            for j in c.job_queue.get_jobs_by_name(jname):
+                j.schedule_removal()
+            c.job_queue.run_repeating(
+                grid_scanner_job, interval=3600, first=10,
+                data={"chat_id": chat_id, "min_score": min_sc},
+                name=jname,
+            )
+            await u.message.reply_text(
+                f"🔍 *تم تفعيل ماسح Grid التلقائي*\n\n"
+                f"⏱ يفحص كل ساعة\n"
+                f"🎯 الحد: ≥`{min_sc}/100`\n"
+                f"📊 يفحص أعلى 100 عملة بالحجم\n"
+                f"⏳ Cooldown: ساعتين بين تنبيهات نفس العملة\n\n"
+                f"إيقاف: `وقف جريد ماسح`",
+                parse_mode="Markdown",
+            )
+            # شغّل أيضاً مراقب الـ Grids (لو فيه)
+            mon_name = f"grid_mon_{chat_id}"
+            for j in c.job_queue.get_jobs_by_name(mon_name):
+                j.schedule_removal()
+            c.job_queue.run_repeating(
+                grid_monitor_job, interval=120, first=60,
+                data={"chat_id": chat_id},
+                name=mon_name,
+            )
+        else:
+            # فحص فوري
+            wait = await u.message.reply_text(
+                "🔍 *جاري فحص فرص Grid...*\n"
+                "⏳ يستغرق 30-60 ثانية...",
+                parse_mode="Markdown",
+            )
+            try:
+                loop = asyncio.get_event_loop()
+                candidates = await asyncio.wait_for(
+                    loop.run_in_executor(None, scan_grid_opportunities, min_sc, 10),
+                    timeout=180,
+                )
+                last_grid_results[chat_id] = candidates
+                msg = build_grid_scanner_alert(candidates, max_show=3)
+                try:
+                    await wait.delete()
+                except Exception:
+                    pass
+                await u.message.reply_text(msg, parse_mode="Markdown")
+            except asyncio.TimeoutError:
+                await u.message.reply_text("⚠️ انتهى الوقت. حاول لاحقاً.")
+            except Exception as e:
+                logging.warning(f"[GRID_SCAN_CMD] {e}")
+                await u.message.reply_text("⚠️ خطأ في الفحص.")
+        return
+
+    # ── إيقاف ماسح الجريد ──
+    if text in ("وقف جريد ماسح", "وقف ماسح جريد", "stop grid scan"):
+        jname = f"grid_scan_{chat_id}"
+        removed = 0
+        for j in c.job_queue.get_jobs_by_name(jname):
+            j.schedule_removal()
+            removed += 1
+        if removed:
+            await u.message.reply_text("⛔ تم إيقاف ماسح Grid التلقائي")
+        else:
+            await u.message.reply_text("لا يوجد ماسح Grid نشط")
+        return
+
+    # ── إنشاء Grid يدوي ──
+    if text.startswith("جريد ") and not text.startswith("جريد ماسح") and \
+       text not in ("جريداتي", "جريد كل"):
+        parts = text.split()
+        if len(parts) < 2:
+            await u.message.reply_text(
+                "📝 الصيغة: `جريد BTC` أو `جريد BTC 5%` أو `جريد BTC قسري`",
+                parse_mode="Markdown",
+            )
+            return
+
+        raw_sym = parts[1].upper()
+        force = any(p in ("قسري", "force") for p in parts)
+        # تحقق من نسبة النطاق المخصصة
+        custom_range = None
+        for p in parts[2:]:
+            if p.endswith("%"):
+                try:
+                    custom_range = float(p.rstrip("%"))
+                except ValueError:
+                    pass
+
+        sym = raw_sym if raw_sym.endswith("USDT") else raw_sym + "USDT"
+
+        wait = await u.message.reply_text(
+            f"📊 *جاري تحليل {sym} للـ Grid...*",
+            parse_mode="Markdown",
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+            analysis = await loop.run_in_executor(None, analyze_grid_suitability, sym, None, None)
+
+            if analysis["current_price"] <= 0:
+                try: await wait.delete()
+                except: pass
+                await u.message.reply_text(f"❌ تعذّر جلب بيانات `{sym}`", parse_mode="Markdown")
+                return
+
+            # لو غير مناسب وما طلب قسري
+            if not analysis["suitable"] and not force:
+                try: await wait.delete()
+                except: pass
+                msg = (f"⚠️ *{sym} غير مناسب لـ Grid*\n\n"
+                       f"📊 Score: `{analysis['score']}/100`\n"
+                       f"🎚 المستوى: {analysis['level']}\n\n")
+                if analysis.get("warnings"):
+                    msg += "⚠️ *الأسباب:*\n"
+                    for w in analysis["warnings"][:4]:
+                        msg += f"  • {w}\n"
+                msg += f"\n💡 لفرض الـ Grid رغم ذلك:\n`جريد {raw_sym} قسري`"
+                await u.message.reply_text(msg, parse_mode="Markdown")
+                return
+
+            # حساب مستويات Grid
+            current_price = analysis["current_price"]
+            if custom_range:
+                range_high = current_price * (1 + custom_range / 100)
+                range_low = current_price * (1 - custom_range / 100)
+            else:
+                range_high = analysis["range_high"]
+                range_low = analysis["range_low"]
+
+            grid = calculate_grid_levels(current_price, range_high, range_low, levels=10)
+
+            # احفظ في active_grids
+            active_grids.setdefault(chat_id, {})[sym] = {
+                "sym":            sym,
+                "center_price":   current_price,
+                "grid":           grid,
+                "analysis":       analysis,
+                "history":        [],
+                "created_at":     time.time(),
+                "range_break_alerted": False,
+            }
+
+            # شغّل المراقب لو ما يشتغل
+            mon_name = f"grid_mon_{chat_id}"
+            jobs_running = c.job_queue.get_jobs_by_name(mon_name)
+            if not jobs_running:
+                c.job_queue.run_repeating(
+                    grid_monitor_job, interval=120, first=60,
+                    data={"chat_id": chat_id},
+                    name=mon_name,
+                )
+
+            try: await wait.delete()
+            except: pass
+
+            # رسالة التأكيد
+            msg = (f"✅ *تم إنشاء Grid: {sym}*\n"
+                   f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                   f"📊 Score: `{analysis['score']}/100` — {analysis['level']}\n"
+                   f"💰 السعر الحالي: `${fmt(current_price)}`\n"
+                   f"📏 النطاق: `${fmt(range_low)}` — `${fmt(range_high)}`\n"
+                   f"📐 عدد المستويات: `{len(grid['buy_levels']) + len(grid['sell_levels'])}`\n"
+                   f"💵 المسافة بين المستويات: `{grid['spacing_pct']:.2f}%`\n"
+                   f"📈 الربح المتوقع/دورة: `{grid['expected_profit_per_cycle']:.2f}%`\n\n"
+                   f"🟢 *مستويات الشراء:*\n")
+            for b in grid["buy_levels"]:
+                msg += f"  #{b['level']}: `${fmt(b['price'])}` ({b['distance']:+.2f}%)\n"
+            msg += f"\n🔴 *مستويات البيع:*\n"
+            for s in grid["sell_levels"]:
+                msg += f"  #{s['level']}: `${fmt(s['price'])}` (+{s['distance']:.2f}%)\n"
+            msg += (f"\n📡 *المراقبة:*\n"
+                    f"  • فحص كل دقيقتين\n"
+                    f"  • تنبيه عند لمس أي مستوى\n"
+                    f"  • تحذير عند خروج النطاق\n\n"
+                    f"⚠️ _تنفيذ يدوي فقط_\n\n"
+                    f"📊 الحالة: `جريد {raw_sym} حالة`\n"
+                    f"🔴 إيقاف: `وقف جريد {raw_sym}`")
+            await u.message.reply_text(msg, parse_mode="Markdown")
+        except Exception as e:
+            logging.warning(f"[GRID_CREATE] {e}")
+            try: await wait.delete()
+            except: pass
+            await u.message.reply_text(f"⚠️ خطأ في إنشاء Grid: {e}")
+        return
+
+    # ── حالة Grid معينة ──
+    if "حالة" in text and "جريد" in text:
+        parts = text.split()
+        sym = None
+        for p in parts:
+            if p.upper() not in ("جريد", "حالة", "GRID", "STATUS"):
+                raw = p.upper()
+                sym = raw if raw.endswith("USDT") else raw + "USDT"
+                break
+        if not sym:
+            await u.message.reply_text("الصيغة: `جريد BTC حالة`", parse_mode="Markdown")
+            return
+
+        grid_data = active_grids.get(chat_id, {}).get(sym)
+        if not grid_data:
+            await u.message.reply_text(f"لا يوجد Grid على `{sym}`", parse_mode="Markdown")
+            return
+
+        msg = build_grid_status(grid_data)
+        await u.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # ── إيقاف Grid معين ──
+    if text.startswith("وقف جريد ") and "ماسح" not in text:
+        parts = text.split()
+        if len(parts) >= 3:
+            raw = parts[2].upper()
+            sym = raw if raw.endswith("USDT") else raw + "USDT"
+            if sym in active_grids.get(chat_id, {}):
+                del active_grids[chat_id][sym]
+                await u.message.reply_text(
+                    f"⛔ تم إيقاف Grid على `{sym}`",
+                    parse_mode="Markdown",
+                )
+            else:
+                await u.message.reply_text(
+                    f"لا يوجد Grid على `{sym}`",
+                    parse_mode="Markdown",
+                )
+        return
+
+    # ── إيقاف كل الجريدات ──
+    if text in ("وقف كل الجريدات", "وقف كل جريد", "stop all grids"):
+        if active_grids.get(chat_id):
+            count = len(active_grids[chat_id])
+            active_grids[chat_id] = {}
+            mon_name = f"grid_mon_{chat_id}"
+            for j in c.job_queue.get_jobs_by_name(mon_name):
+                j.schedule_removal()
+            await u.message.reply_text(f"⛔ تم إيقاف {count} Grid")
+        else:
+            await u.message.reply_text("لا توجد Grids نشطة")
+        return
+
+    # ── عرض جريداتي ──
+    if text in ("جريداتي", "جريداتى", "my grids"):
+        grids = active_grids.get(chat_id, {})
+        if not grids:
+            await u.message.reply_text(
+                "📭 لا توجد Grids نشطة.\n\n"
+                "💡 ابدأ بـ:\n"
+                "  `جريد ماسح` — اكتشف الفرص\n"
+                "  `جريد BTC` — Grid يدوي",
+                parse_mode="Markdown",
+            )
+            return
+
+        msg = f"📊 *Grids النشطة ({len(grids)}):*\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        for sym, gd in grids.items():
+            grid = gd.get("grid", {})
+            history = gd.get("history", [])
+            current = fetch_current_price(sym)
+            center = gd.get("center_price", 0)
+
+            filled_buys = sum(1 for b in grid.get("buy_levels", []) if b.get("filled"))
+            filled_sells = sum(1 for s in grid.get("sell_levels", []) if s.get("filled"))
+            chg_pct = ((current - center) / center * 100) if center > 0 else 0
+
+            msg += f"*{sym}*\n"
+            msg += f"  💰 الآن: `${fmt(current)}` ({chg_pct:+.2f}% من المركز)\n"
+            msg += f"  📏 النطاق: `${fmt(grid.get('range_low',0))}` - `${fmt(grid.get('range_high',0))}`\n"
+            msg += f"  🟢 شراء: {filled_buys}/{len(grid.get('buy_levels', []))}\n"
+            msg += f"  🔴 بيع: {filled_sells}/{len(grid.get('sell_levels', []))}\n"
+            msg += f"  📋 معاملات: {len(history)}\n\n"
+        msg += f"💡 للتفاصيل: `جريد BTC حالة`"
+        await u.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # ── نتائج آخر فحص ماسح ──
+    if text in ("جريد نتائج", "نتائج جريد", "grid results"):
+        results = last_grid_results.get(chat_id, [])
+        if not results:
+            await u.message.reply_text(
+                "لا توجد نتائج بعد.\nفعّل الماسح: `جريد ماسح`",
+                parse_mode="Markdown",
+            )
+            return
+        msg = build_grid_scanner_alert(results, max_show=5)
+        await u.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # ══════════════════════════════════════════════════════════════
+    # نهاية أوامر Grid
+    # ══════════════════════════════════════════════════════════════
+
     await u.message.reply_text(
         "الأوامر:\n`كاشف` — تفعيل\n`وقف` — إيقاف\n`نتائج` — آخر رصد\n`صفقاتي` — صفقات مفتوحة",
         parse_mode="Markdown")
@@ -1936,6 +2866,19 @@ async def handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("hold:"):
         await q.answer("⏳ حسناً — سنستمر بالمراقبة", show_alert=True)
 
+    elif data == "grid:results":
+        # عرض كل نتائج الماسح
+        results = last_grid_results.get(chat_id, [])
+        if not results:
+            await q.answer("لا توجد نتائج", show_alert=True)
+            return
+        msg = build_grid_scanner_alert(results, max_show=5)
+        try:
+            await q.message.reply_text(msg, parse_mode="Markdown")
+            await q.answer()
+        except Exception as e:
+            await q.answer(f"خطأ: {e}", show_alert=True)
+
 
 # ══════════════════════════════════════════════════════════════
 # Main
@@ -1960,15 +2903,20 @@ async def _post_init(app):
         binance_status = f"❌ ({type(e).__name__})"
 
     print("=" * 55)
-    print("  💥 EXPLOSION DETECTOR BOT — Running ✅")
+    print("  💥 EXPLOSION DETECTOR BOT v3 — Running ✅")
     print("=" * 55)
-    print(f"  Binance Futures : {binance_status}")
-    print(f"  المؤشرات        : 7 (Volume, CVD, BB, RSI, +)")
-    print(f"  المراحل         : pre_explosion → start → now")
-    print(f"  Squeeze→Breakout: 💎 إشارة ذهبية")
-    print(f"  المسح           : كل 5 دقائق")
-    print(f"  المراقبة        : كل دقيقتين")
-    print(f"  cooldown        : ساعة لكل عملة")
+    print(f"  Binance Futures  : {binance_status}")
+    print(f"  المؤشرات         : 7 (Volume, CVD, BB, RSI, +)")
+    print(f"  المراحل          : pre_explosion → start → now")
+    print(f"  الفلاتر الذكية   : 7 (BTC + MTF + OB + ...)")
+    print(f"  Squeeze→Breakout : 💎 إشارة ذهبية")
+    print(f"  المسح            : كل 5 دقائق")
+    print(f"  المراقبة         : كل دقيقتين")
+    print(f"  cooldown         : ساعة لكل عملة")
+    print(f"  ─────────────────────────────────")
+    print(f"  🆕 Smart Grid    : ماسح ذكي + يدوي")
+    print(f"  Grid Scanner     : كل ساعة (لو فعّلت)")
+    print(f"  Grid Monitor     : كل دقيقتين")
     print("=" * 55)
     print("  أرسل /start على تيليقرام")
     print("=" * 55)
