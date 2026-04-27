@@ -673,6 +673,178 @@ def check_btc_correlation(sym: str, direction: str = "long") -> dict:
     return result
 
 
+def detect_pre_explosion(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> dict:
+    """
+    🎯 الاكتشاف المبكر — يلتقط مرحلة التراكم قبل الانفجار
+    يبحث عن:
+      1. Volume Climbing — حجم يتزايد تدريجياً (مش انفجار مفاجئ)
+      2. Higher Lows — قيعان صاعدة (تراكم ذكي)
+      3. Compression — ضيق Bollinger الشديد
+      4. Stealth Accumulation — buy pressure متزايد بهدوء
+      5. EMA Curl Up — EMA21 يبدأ يتقوّس صاعداً
+      6. RSI Divergence — RSI صاعد قبل السعر
+    """
+    result = {
+        "score": 0,
+        "signals": [],
+        "is_pre_explosion": False,
+        "details": {},
+    }
+    try:
+        if df is None or len(df) < 50:
+            return result
+
+        c = df["c"]; h = df["h"]; l = df["l"]; v = df["qv"]; bq = df["bq"]
+        price = float(c.iloc[-1])
+        if price <= 0:
+            return result
+
+        score = 0
+        signals = []
+
+        # ═══════════════════════════════════════════
+        # 1. Volume Climbing (حجم يتزايد تدريجياً)
+        # المتوسط آخر 5 شموع > متوسط 20 شمعة قبلها
+        # ═══════════════════════════════════════════
+        recent_vol = v.iloc[-5:].mean()
+        older_vol = v.iloc[-25:-5].mean()
+        if older_vol > 0:
+            vol_climb_ratio = recent_vol / older_vol
+            result["details"]["vol_climb"] = vol_climb_ratio
+            if vol_climb_ratio > 2.0:
+                score += 25
+                signals.append(f"📈 حجم يتزايد x{vol_climb_ratio:.1f} (تراكم نشط)")
+            elif vol_climb_ratio > 1.5:
+                score += 15
+                signals.append(f"📈 حجم يتزايد x{vol_climb_ratio:.1f}")
+            elif vol_climb_ratio > 1.2:
+                score += 8
+
+        # ═══════════════════════════════════════════
+        # 2. Higher Lows (قيعان صاعدة = تراكم)
+        # ═══════════════════════════════════════════
+        last_10_lows = l.iloc[-10:].values
+        # نقسم لجزئين ونقارن أدنى القاع
+        first_half_low = last_10_lows[:5].min()
+        second_half_low = last_10_lows[5:].min()
+        if first_half_low > 0:
+            low_progress = (second_half_low - first_half_low) / first_half_low * 100
+            result["details"]["higher_lows"] = low_progress
+            if low_progress > 0.5:
+                score += 20
+                signals.append(f"📊 قيعان صاعدة (+{low_progress:.2f}%)")
+            elif low_progress > 0:
+                score += 10
+
+        # ═══════════════════════════════════════════
+        # 3. Bollinger Compression (ضيق شديد)
+        # ═══════════════════════════════════════════
+        bb_period = 20
+        bb_std = c.rolling(bb_period).std()
+        bb_mid = c.rolling(bb_period).mean()
+        bb_width = (bb_std.iloc[-1] * 4) / bb_mid.iloc[-1] * 100 if bb_mid.iloc[-1] > 0 else 999
+        # نقارن مع آخر 50 شمعة
+        bb_widths_history = ((bb_std * 4) / bb_mid * 100).iloc[-50:].dropna()
+        if len(bb_widths_history) > 10:
+            bb_percentile = (bb_width <= bb_widths_history).sum() / len(bb_widths_history) * 100
+            result["details"]["bb_compression"] = bb_percentile
+            if bb_percentile <= 15:  # في أقل 15% من العادة (ضيق نادر)
+                score += 25
+                signals.append(f"💎 Bollinger ضيق نادر ({bb_percentile:.0f}% percentile)")
+            elif bb_percentile <= 30:
+                score += 15
+                signals.append(f"📊 Bollinger ضيق ({bb_percentile:.0f}% percentile)")
+
+        # ═══════════════════════════════════════════
+        # 4. Stealth Buy Pressure (شراء صامت متزايد)
+        # buy ratio في آخر 10 شموع > buy ratio في الـ 20 قبلها
+        # ═══════════════════════════════════════════
+        buy_ratios_recent = []
+        buy_ratios_older = []
+        for i in range(-10, 0):
+            if v.iloc[i] > 0:
+                buy_ratios_recent.append(bq.iloc[i] / v.iloc[i])
+        for i in range(-30, -10):
+            if v.iloc[i] > 0:
+                buy_ratios_older.append(bq.iloc[i] / v.iloc[i])
+        if buy_ratios_recent and buy_ratios_older:
+            recent_buy = sum(buy_ratios_recent) / len(buy_ratios_recent) * 100
+            older_buy = sum(buy_ratios_older) / len(buy_ratios_older) * 100
+            buy_climb = recent_buy - older_buy
+            result["details"]["stealth_buy"] = buy_climb
+            if buy_climb > 8 and recent_buy > 55:
+                score += 20
+                signals.append(f"🤫 شراء صامت ↑ ({recent_buy:.0f}% vs {older_buy:.0f}%)")
+            elif buy_climb > 4:
+                score += 10
+
+        # ═══════════════════════════════════════════
+        # 5. EMA21 Curl Up (يبدأ ينحني للأعلى)
+        # ═══════════════════════════════════════════
+        ema21 = c.ewm(span=21).mean()
+        ema21_now = ema21.iloc[-1]
+        ema21_5_ago = ema21.iloc[-6]
+        ema21_10_ago = ema21.iloc[-11]
+        # هل التغيير يتسارع؟
+        slope_recent = (ema21_now - ema21_5_ago) / ema21_5_ago * 100 if ema21_5_ago > 0 else 0
+        slope_older = (ema21_5_ago - ema21_10_ago) / ema21_10_ago * 100 if ema21_10_ago > 0 else 0
+        if slope_recent > 0 and slope_recent > slope_older * 1.5 and slope_recent > 0.2:
+            score += 15
+            signals.append(f"📈 EMA21 يتقوس صاعد ({slope_recent:.2f}%)")
+
+        # ═══════════════════════════════════════════
+        # 6. RSI Bullish Divergence (RSI صاعد + السعر هابط/جانبي)
+        # ═══════════════════════════════════════════
+        delta = c.diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss.replace(0, 0.01)
+        rsi = 100 - (100 / (1 + rs))
+        rsi_now = rsi.iloc[-1]
+        rsi_10_ago = rsi.iloc[-11]
+        price_now = c.iloc[-1]
+        price_10_ago = c.iloc[-11]
+        if rsi_10_ago and price_10_ago:
+            rsi_change = rsi_now - rsi_10_ago
+            price_change_pct = (price_now - price_10_ago) / price_10_ago * 100
+            # RSI صاعد لكن السعر مش صاعد كثير = divergence
+            if rsi_change > 8 and price_change_pct < 1.5 and rsi_now > 45 and rsi_now < 70:
+                score += 18
+                signals.append(f"💎 Bullish Divergence (RSI ↑ {rsi_change:.1f})")
+
+        # ═══════════════════════════════════════════
+        # 7. 15m Confirmation (للتأكيد)
+        # ═══════════════════════════════════════════
+        if df_15m is not None and len(df_15m) > 30:
+            ema21_15m = df_15m["c"].ewm(span=21).mean()
+            price_15m = df_15m["c"].iloc[-1]
+            ema21_15m_now = ema21_15m.iloc[-1]
+            if price_15m > ema21_15m_now:
+                # السعر فوق EMA21 على 15m
+                ema_dist = (price_15m - ema21_15m_now) / ema21_15m_now * 100
+                if 0 < ema_dist < 3:  # قريب جداً (مش بعيد = ما طار بعد)
+                    score += 12
+                    signals.append("📊 15m: السعر فوق EMA21 (قريب)")
+
+        result["score"] = min(100, score)
+        result["signals"] = signals
+        result["is_pre_explosion"] = score >= 50
+
+        # تصنيف الجودة
+        if score >= 75:
+            result["quality"] = "🎯 إشارة مبكرة قوية"
+        elif score >= 60:
+            result["quality"] = "📊 إشارة مبكرة جيدة"
+        elif score >= 50:
+            result["quality"] = "⏳ تراكم محتمل"
+        else:
+            result["quality"] = "—"
+
+    except Exception as e:
+        logging.warning(f"[PRE_EXPL] {e}")
+    return result
+
+
 # ══════════════════════════════════════════════════════════════
 # محرك الكشف
 # ══════════════════════════════════════════════════════════════
@@ -974,6 +1146,13 @@ def analyze_coin(sym: str, meta: dict) -> dict:
     result["smart_filters"] = smart_filters
     result["smart_score"] = smart_filters["smart_score"]
 
+    # ═══════════════════════════════════════════════════════════
+    # 🆕 الكشف المبكر — يلتقط مرحلة التراكم قبل الانفجار
+    # هذا يضيف مرحلة جديدة "pre_explosion_early" قبل بدء الحركة
+    # ═══════════════════════════════════════════════════════════
+    pre_expl = detect_pre_explosion(df, df_15m=None)
+    result["pre_explosion"] = pre_expl
+
     # تحديد المرحلة (مع اعتبار جودة الإشارة)
     filters_passed = smart_filters["filters_passed"]
     if result["score"] >= 70 and filters_passed >= 4:
@@ -984,8 +1163,23 @@ def analyze_coin(sym: str, meta: dict) -> dict:
         result["phase"] = "explosion_start_strong"  # 🆕 بداية قوية
     elif result["score"] >= 50:
         result["phase"] = "explosion_start"
+    elif pre_expl["is_pre_explosion"] and pre_expl["score"] >= 60:
+        # 🆕 إشارة مبكرة قبل أي انفجار (الذهب الحقيقي!)
+        result["phase"] = "pre_explosion_early"
+        # دمج إشارات pre-explosion في القائمة
+        for sig in pre_expl["signals"]:
+            if sig not in result["signals"]:
+                result["signals"].append(sig)
+        # ادمج النقاط
+        result["score"] = max(result["score"], pre_expl["score"])
     elif result["score"] >= 35:
         result["phase"] = "pre_explosion"
+    elif pre_expl["is_pre_explosion"]:
+        # نقاط منخفضة لكن pre-explosion قوي
+        result["phase"] = "pre_explosion"
+        for sig in pre_expl["signals"]:
+            if sig not in result["signals"]:
+                result["signals"].append(sig)
 
     # رفض الإشارة لو فيها أسباب رفض حرجة
     if smart_filters["applied"]:
@@ -1120,6 +1314,7 @@ PHASE_LABELS = {
     "explosion_now":          "🚨 انفجار الآن!",
     "explosion_start_strong": "⚡⚡ بداية انفجار قوية",
     "explosion_start":        "⚡ بدء الانفجار",
+    "pre_explosion_early":    "🌱 تراكم مبكر — قبل الانفجار",
     "pre_explosion":          "⏳ على وشك الانفجار",
     "rejected":               "🚫 مرفوضة (الاتجاه معاكس)",
 }
@@ -1142,6 +1337,8 @@ def build_entry_alert(r: dict, rank: int = 1) -> str:
         icon = "🚨"
     elif phase == "explosion_start_strong":
         icon = "⚡⚡"
+    elif phase == "pre_explosion_early":
+        icon = "🌱"
     else:
         icon = "⚡"
     bar  = "█" * int(score/10) + "░" * (10 - int(score/10))
@@ -1278,13 +1475,20 @@ async def scanner_job(ctx: ContextTypes.DEFAULT_TYPE):
                     # 🆕 لو وضع الجودة العالية، فلتر إضافي
                     sf = r.get("smart_filters", {})
                     if quality_mode:
-                        # في quality mode، نقبل فقط explosion_premium أو explosion_now
-                        # مع 4+ فلاتر
-                        if r["phase"] not in ("explosion_premium", "explosion_now",
+                        # في quality mode، نقبل الإشارات المبكرة + الفاخرة + القوية
+                        # pre_explosion_early مهم لأنه يلتقط قبل الانفجار!
+                        if r["phase"] not in ("pre_explosion_early",
+                                               "explosion_premium",
+                                               "explosion_now",
                                                "explosion_start_strong"):
                             rejected += 1
                             continue
-                        if sf.get("filters_passed", 0) < 4:
+                        # تخفيف شرط الفلاتر للإشارات المبكرة
+                        # (الفلاتر الذكية ما تشتغل دائماً قبل الانفجار)
+                        min_filters_required = 4
+                        if r["phase"] == "pre_explosion_early":
+                            min_filters_required = 2  # تساهل أكثر للمبكر
+                        if sf.get("filters_passed", 0) < min_filters_required:
                             rejected += 1
                             continue
 
@@ -1296,13 +1500,15 @@ async def scanner_job(ctx: ContextTypes.DEFAULT_TYPE):
                     alerts.append(r)
                 except: continue
 
-            # 🆕 ترتيب ذكي: explosion_premium أولاً، ثم حسب النقاط
+            # 🆕 ترتيب ذكي: pre_explosion_early يأتي مع الفاخرة!
+            # لأن المبكر = أهم لحظة للدخول
             phase_order = {
-                "explosion_premium": 0,
-                "explosion_now": 1,
-                "explosion_start_strong": 2,
-                "explosion_start": 3,
-                "pre_explosion": 4,
+                "pre_explosion_early": 0,  # 🌱 الأول! (تراكم مبكر)
+                "explosion_premium": 1,
+                "explosion_now": 2,
+                "explosion_start_strong": 3,
+                "explosion_start": 4,
+                "pre_explosion": 5,
             }
             alerts.sort(key=lambda x: (phase_order.get(x["phase"], 5), -x["score"]))
             return alerts, rejected
@@ -1392,41 +1598,38 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💥 *EXPLOSION DETECTOR BOT v2*\n"
-        "كاشف الانفجار السعري المبكر — *مع 7 فلاتر ذكية*\n\n"
+        "💥 *EXPLOSION DETECTOR BOT v2.1*\n"
+        "كاشف الانفجار السعري — *مع الكشف المبكر* 🌱\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚙️ *أوضاع الكاشف:*\n\n"
+        "🌱 `كاشف مبكر`     — *قبل الانفجار!* (تراكم) ⭐\n"
         "🟢 `كاشف`           — تفعيل عادي (دقة ~55%)\n"
         "⚖️ `كاشف متوازن`    — جودة معتدلة (~65%)\n"
         "💎 `كاشف جودة`      — عالي الجودة (~75%)\n"
         "👑 `كاشف ذهبي`      — النخبة فقط (~80%)\n\n"
-        "أو حدد النقاط:\n"
-        "`كاشف 50` `كاشف 60` `كاشف 70`\n\n"
         "🔴 *إيقاف:* `وقف`\n\n"
         "📊 *معلومات:*\n"
         "`نتائج`    — آخر عمليات الرصد\n"
         "`صفقاتي`   — الصفقات المفتوحة\n"
         "`btc`       — حالة BTC الآن\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
+        "🌱 *الكشف المبكر يبحث عن:*\n"
+        "  • حجم يتزايد تدريجياً (تراكم)\n"
+        "  • قيعان صاعدة (دعم قوي)\n"
+        "  • Bollinger ضيق نادر (انضغاط)\n"
+        "  • شراء صامت متزايد\n"
+        "  • EMA21 يتقوس صاعد\n"
+        "  • Bullish RSI Divergence\n\n"
+        "💡 *الكشف المبكر = إشارة قبل الحركة*\n"
+        "💡 *الكشف العادي = إشارة مع الحركة*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
         "🛡 *الفلاتر الذكية (7):*\n"
-        "  ① BTC Trend     — اتجاه السوق\n"
-        "  ② MTF Confirm   — توافق الفريمات\n"
-        "  ③ Order Book    — ضغط الأوامر\n"
-        "  ④ Funding/OI    — تمويل + OI\n"
-        "  ⑤ Sweep+Reclaim — كسر السيولة\n"
-        "  ⑥ Volume Quality — جودة الحجم\n"
-        "  ⑦ BTC Correl    — ارتباط BTC\n\n"
-        "🎯 *مؤشرات الانفجار الأساسية (7):*\n"
-        "• Volume Surge x4+ مفاجئ\n"
-        "• CVD ينكسر للأعلى\n"
-        "• كسر Bollinger Squeeze\n"
-        "• RSI يكسر 60 صاعداً\n"
-        "• كسر أعلى سعر 20 شمعة\n\n"
+        "  ① BTC Trend ② MTF ③ Order Book\n"
+        "  ④ Funding/OI ⑤ Sweep ⑥ Vol Quality\n"
+        "  ⑦ BTC Correlation\n\n"
         "🔔 *تنبيه خروج تلقائي عند:*\n"
-        "• وصول Stop Loss\n"
-        "• RSI ذروة شراء + انعكاس\n"
-        "• CVD ينعكس\n"
-        "• تراجع 3%+ من القمة\n\n"
+        "• وصول SL • RSI ذروة\n"
+        "• CVD ينعكس • تراجع 3%+ من القمة\n\n"
         "⚠️ _للأغراض التعليمية فقط_",
         parse_mode="Markdown")
 
@@ -1494,7 +1697,13 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         # 🆕 وضع الجودة العالية
         for p in parts:
             pl = p.lower()
-            if pl in ("جودة", "quality", "premium", "فاخر"):
+            if pl in ("مبكر", "early", "pre"):
+                # 🆕 وضع الكشف المبكر — يلتقط قبل الانفجار
+                quality_mode = True
+                min_filters = 1  # مرونة عالية للمبكر
+                min_sc = 30  # نقاط منخفضة لأن الانفجار لم يبدأ
+                mode_label = "🌱 كشف مبكر (قبل الانفجار)"
+            elif pl in ("جودة", "quality", "premium", "فاخر"):
                 quality_mode = True
                 min_filters = 4
                 min_sc = 60
@@ -1573,6 +1782,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         msg += "  ⑦ BTC Correl    — ارتباط BTC\n\n"
 
         msg += "💡 *أوضاع متاحة:*\n"
+        msg += "  🌱 `كاشف مبكر` — *قبل الانفجار!* ⭐\n"
         msg += "  `كاشف عادي`    — كل الإشارات (دقة ~55%)\n"
         msg += "  `كاشف متوازن`  — جودة معتدلة (~65%)\n"
         msg += "  `كاشف جودة`    — عالي الجودة (~75%)\n"
