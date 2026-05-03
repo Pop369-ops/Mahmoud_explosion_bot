@@ -1,0 +1,212 @@
+"""Inline button callback handlers."""
+from telegram import Update
+from telegram.ext import ContextTypes
+from core.state import state
+from core.models import Mode
+from core.logger import get_logger
+from ui.alerts import build_status_message
+from ui.keyboards import (main_menu_keyboard, settings_keyboard,
+                           mode_keyboard, conf_keyboard)
+
+log = get_logger(__name__)
+
+
+async def handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    chat_id = q.message.chat_id
+    data = q.data
+    await q.answer()
+
+    try:
+        if data.startswith("track:"):
+            await _on_track(q, chat_id, data.split(":", 1)[1])
+
+        elif data.startswith("ignore:"):
+            sym = data.split(":", 1)[1]
+            state.mark_alerted(chat_id, sym)
+            await state.remove_pending(chat_id, sym)
+            await q.answer(f"✅ تم تجاهل {sym} لساعة", show_alert=True)
+            await q.edit_message_reply_markup(reply_markup=None)
+
+        elif data.startswith("ai:"):
+            await _on_ai(q, chat_id, data.split(":", 1)[1])
+
+        elif data.startswith("detail:"):
+            await _on_detail(q, chat_id, data.split(":", 1)[1])
+
+        elif data.startswith("closed:"):
+            sym = data.split(":", 1)[1]
+            await state.remove_trade(chat_id, sym)
+            await q.answer(f"✅ تم إغلاق {sym}", show_alert=True)
+            await q.edit_message_reply_markup(reply_markup=None)
+
+        elif data.startswith("hold:"):
+            await q.answer("⏳ سنستمر بالمراقبة", show_alert=True)
+
+        elif data == "cmd:scan":
+            from scanner.orchestrator import run_scan_for_user
+            await q.answer("🔍 جاري المسح...")
+            try:
+                signals = await run_scan_for_user(chat_id, c.bot, send_alerts=True)
+                await c.bot.send_message(chat_id=chat_id,
+                                          text=f"✅ المسح اكتمل — {len(signals)} إشارة")
+            except Exception as e:
+                await c.bot.send_message(chat_id=chat_id, text=f"❌ {e}")
+
+        elif data == "cmd:status":
+            trades = state.get_trades(chat_id)
+            last = state.get_last_results(chat_id)
+            msg = build_status_message(chat_id, trades, last)
+            await q.message.reply_text(msg, parse_mode="Markdown")
+
+        elif data == "cmd:menu":
+            await q.edit_message_text("🏠 *القائمة الرئيسية*", parse_mode="Markdown",
+                                       reply_markup=main_menu_keyboard())
+
+        elif data == "cmd:settings":
+            cfg = state.get_user_cfg(chat_id)
+            await q.edit_message_text("⚙️ *الإعدادات*", parse_mode="Markdown",
+                                       reply_markup=settings_keyboard(cfg))
+
+        elif data == "cmd:trades":
+            trades = state.get_trades(chat_id)
+            if not trades:
+                await q.message.reply_text("📭 لا صفقات مفتوحة")
+            else:
+                msg = "📈 *صفقاتك المفتوحة:*\n\n"
+                for sym, t in trades.items():
+                    msg += f"• *{sym}*: P/L `{t.pnl_pct:+.2f}%`\n"
+                await q.message.reply_text(msg, parse_mode="Markdown")
+
+        elif data == "cmd:autoscan_toggle":
+            from scanner.orchestrator import enable_auto_scan, disable_auto_scan
+            cfg = state.get_user_cfg(chat_id)
+            cfg["auto_scan"] = not cfg.get("auto_scan", False)
+            status_word = "مفعّل ✅" if cfg["auto_scan"] else "معطّل ❌"
+            await q.answer(f"المسح التلقائي: {status_word}", show_alert=True)
+            if cfg["auto_scan"]:
+                enable_auto_scan(c, chat_id)
+            else:
+                disable_auto_scan(c, chat_id)
+
+        elif data == "set:mode":
+            await q.edit_message_text("اختر الوضع:", reply_markup=mode_keyboard())
+
+        elif data.startswith("mode:"):
+            mode = data.split(":", 1)[1]
+            state.update_user_cfg(chat_id, mode=Mode(mode))
+            await q.answer(f"✅ الوضع: {mode}", show_alert=True)
+            cfg = state.get_user_cfg(chat_id)
+            await q.edit_message_text("⚙️ *الإعدادات*", parse_mode="Markdown",
+                                       reply_markup=settings_keyboard(cfg))
+
+        elif data == "set:conf":
+            await q.edit_message_text("اختر الحد الأدنى:", reply_markup=conf_keyboard())
+
+        elif data.startswith("conf:"):
+            val = int(data.split(":", 1)[1])
+            state.update_user_cfg(chat_id, min_confidence=val)
+            await q.answer(f"✅ الحد الأدنى: {val}", show_alert=True)
+            cfg = state.get_user_cfg(chat_id)
+            await q.edit_message_text("⚙️ *الإعدادات*", parse_mode="Markdown",
+                                       reply_markup=settings_keyboard(cfg))
+
+    except Exception as e:
+        log.warning("callback_error", err=str(e), data=data)
+
+
+async def _on_track(q, chat_id: int, symbol: str):
+    from trading.manager import open_trade_from_signal
+    from core.models import Signal, Phase, Mode
+
+    pending = state.get_pending(chat_id, symbol)
+    if not pending:
+        await q.answer("⚠️ الإشارة منتهية الصلاحية. أعد المسح.", show_alert=True)
+        return
+
+    if state.has_trade(chat_id, symbol):
+        await q.answer("هذه العملة متابعة بالفعل", show_alert=True)
+        return
+
+    try:
+        sig = Signal(
+            symbol=symbol,
+            phase=Phase(pending.get("phase", "none")),
+            confidence=pending.get("confidence", 0),
+            sources_agreed=pending.get("sources_agreed", 0),
+            sources_total=pending.get("sources_total", 0),
+            price=pending.get("price", 0),
+            change_24h=pending.get("change_24h", 0),
+            volume_24h=pending.get("volume_24h", 0),
+            entry=pending.get("entry", 0),
+            sl=pending.get("sl", 0),
+            tp1=pending.get("tp1", 0),
+            tp2=pending.get("tp2", 0),
+            tp3=pending.get("tp3", 0),
+            sl_pct=pending.get("sl_pct", 0),
+            atr=pending.get("atr", 0),
+            mode=Mode(pending.get("mode", "day")),
+        )
+        await open_trade_from_signal(chat_id, sig)
+        await state.remove_pending(chat_id, symbol)
+        await q.answer("✅ بدأت المراقبة", show_alert=False)
+        await q.edit_message_text(
+            q.message.text + "\n\n👁 *المراقبة بدأت — ستستلم تنبيه عند TP/SL*",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log.warning("track_error", err=str(e))
+        await q.answer(f"خطأ: {e}", show_alert=True)
+
+
+async def _on_ai(q, chat_id: int, symbol: str):
+    from ai.analyst import deep_analyze
+    from data_sources.binance import binance
+    from scorer.confidence_engine import score_symbol
+    from core.models import MarketSnapshot
+
+    pending = state.get_pending(chat_id, symbol)
+    if not pending:
+        await q.answer("⚠️ الإشارة منتهية", show_alert=True)
+        return
+
+    msg = await q.message.reply_text("🤖 جاري التحليل العميق...")
+    try:
+        df = await binance.fetch_klines(symbol, "5m", 80)
+        ob = await binance.fetch_order_book(symbol)
+        snap = MarketSnapshot(
+            symbol=symbol,
+            price=pending.get("price", 0),
+            volume_24h=pending.get("volume_24h", 0),
+            change_24h=pending.get("change_24h", 0),
+            klines=df, order_book=ob,
+        )
+        cfg = state.get_user_cfg(chat_id)
+        sig = await score_symbol(snap, mode=cfg["mode"])
+        analysis = await deep_analyze(sig, snap)
+        await msg.edit_text(analysis, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _on_detail(q, chat_id: int, symbol: str):
+    pending = state.get_pending(chat_id, symbol)
+    if not pending:
+        await q.answer("⚠️ الإشارة منتهية", show_alert=True)
+        return
+
+    verdicts = pending.get("verdicts_detail", [])
+    if not verdicts:
+        await q.answer("لا تفاصيل متوفرة", show_alert=True)
+        return
+
+    msg = f"📈 *تفاصيل {symbol}:*\n\n"
+    for v in verdicts:
+        emoji = "🟢" if v["score"] >= 65 else "🔴" if v["score"] < 40 else "⚪"
+        msg += f"{emoji} *{v['name']}*: {v['score']}/100 (ثقة {v['confidence']:.0%})\n"
+        for r in v.get("reasons", [])[:2]:
+            msg += f"   ✓ {r}\n"
+        for w in v.get("warnings", [])[:2]:
+            msg += f"   ⚠ {w}\n"
+        msg += "\n"
+    await q.message.reply_text(msg, parse_mode="Markdown")
