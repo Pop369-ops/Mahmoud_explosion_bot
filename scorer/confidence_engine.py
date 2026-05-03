@@ -95,7 +95,7 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
     sig.warnings = all_warnings
 
     sig.phase = _classify_phase(confidence, sources_agreed, verdicts)
-    _attach_tp_sl(sig, snap, mode)
+    _attach_tp_sl(sig, snap, mode, direction)
     _attach_quick_metrics(sig, snap)
     return sig
 
@@ -121,40 +121,41 @@ def _classify_phase(confidence: int, sources_agreed: int,
     return Phase.NONE
 
 
-def _attach_tp_sl(sig: Signal, snap: MarketSnapshot, mode: Mode):
+def _attach_tp_sl(sig: Signal, snap: MarketSnapshot, mode: Mode, direction: str = "long"):
+    """Liquidity-aware SL/TP: hides stops behind real swing/wall liquidity
+    so that stop hunts (sweeps) don't trigger before the real move.
+    Falls back to ATR-based placement if no clear liquidity is found."""
+    from scorer.liquidity_levels import build_plan
+
     df = snap.klines
     if df is None or len(df) < 15:
         return
 
-    h = df["h"].astype(float).values
-    l = df["l"].astype(float).values
-    c = df["c"].astype(float).values
+    plan = build_plan(
+        price=snap.price,
+        df=df,
+        order_book=snap.order_book or {},
+        direction=direction,
+        mode=mode.value,
+    )
 
-    tr_vals = [
-        max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
-        for i in range(1, len(c))
-    ]
-    if len(tr_vals) < 14:
-        return
+    sig.entry = plan.entry
+    sig.sl = plan.sl
+    sig.tp1 = plan.tp1
+    sig.tp2 = plan.tp2
+    sig.tp3 = plan.tp3
+    sig.sl_pct = plan.sl_pct
+    sig.atr = 0.0  # legacy field, kept for compatibility
 
-    atr = float(pd.Series(tr_vals[-14:]).mean())
-    price = snap.price
-
-    if mode == Mode.SCALP:
-        sl_mult, tp_mults = 1.2, (1.2, 2.0, 3.0)
-    elif mode == Mode.SWING:
-        sl_mult, tp_mults = 2.0, (2.0, 4.0, 7.0)
-    else:
-        sl_mult, tp_mults = 1.5, (1.5, 3.0, 5.0)
-
-    sl_dist = max(atr * sl_mult, price * 0.012)
-    sig.atr = atr
-    sig.entry = round(price, 8)
-    sig.sl = round(price - sl_dist, 8)
-    sig.tp1 = round(price + sl_dist * tp_mults[0], 8)
-    sig.tp2 = round(price + sl_dist * tp_mults[1], 8)
-    sig.tp3 = round(price + sl_dist * tp_mults[2], 8)
-    sig.sl_pct = round(sl_dist / price * 100, 2) if price > 0 else 0
+    # Inject liquidity rationale into the alert
+    sig.signals.append(f"🛡 SL: {plan.sl_logic}")
+    sig.signals.append(f"🎯 TP: {plan.tp_logic}")
+    sig.signals.append(
+        f"⚖️ R:R = {plan.rr_tp1:.2f} / {plan.rr_tp2:.2f} / {plan.rr_tp3:.2f}"
+    )
+    if plan.method == "atr_fallback":
+        sig.warnings.append("⚠️ سيولة غير واضحة — اعتمد ATR (احتمال stop hunt أعلى)")
+    sig.warnings.extend(plan.warnings)
 
 
 def _attach_quick_metrics(sig: Signal, snap: MarketSnapshot):
