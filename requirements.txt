@@ -1,4 +1,5 @@
 python-telegram-bot[job-queue]==20.7
+APScheduler==3.10.4
 aiohttp==3.9.5
 websockets==12.0
 pandas==2.2.2

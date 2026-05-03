@@ -1,6 +1,7 @@
 """Inline button callback handlers."""
 from telegram import Update
 from telegram.ext import ContextTypes
+from config.settings import settings
 from core.state import state
 from core.models import Mode
 from core.logger import get_logger
@@ -81,13 +82,57 @@ async def handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
         elif data == "cmd:autoscan_toggle":
             from scanner.orchestrator import enable_auto_scan, disable_auto_scan
             cfg = state.get_user_cfg(chat_id)
-            cfg["auto_scan"] = not cfg.get("auto_scan", False)
-            status_word = "مفعّل ✅" if cfg["auto_scan"] else "معطّل ❌"
-            await q.answer(f"المسح التلقائي: {status_word}", show_alert=True)
-            if cfg["auto_scan"]:
-                enable_auto_scan(c, chat_id)
-            else:
-                disable_auto_scan(c, chat_id)
+            new_state = not cfg.get("auto_scan", False)
+
+            # CRITICAL: verify job_queue exists before toggling
+            if c.application.job_queue is None:
+                await q.answer("⚠️ JobQueue غير مفعل", show_alert=True)
+                await c.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ *المسح التلقائي غير متاح*\n\n"
+                         "السبب: مكتبة `apscheduler` ناقصة في النشر.\n\n"
+                         "*الحل:* تأكد إن `requirements.txt` يحتوي:\n"
+                         "`python-telegram-bot[job-queue]==20.7`\n"
+                         "`APScheduler==3.10.4`\n\n"
+                         "ثم أعد النشر على Railway.\n\n"
+                         "💡 حالياً: استخدم زر *🔍 مسح الآن* يدوياً.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            try:
+                if new_state:
+                    enable_auto_scan(c, chat_id)
+                    cfg["auto_scan"] = True
+                    interval_min = settings.scan_interval // 60
+                    await c.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"✅ *المسح التلقائي: مفعّل*\n\n"
+                             f"⏱ كل {interval_min} دقيقة\n"
+                             f"🎯 الحد الأدنى للثقة: {cfg['min_confidence']}/100\n"
+                             f"🛡 المصادر المطلوبة: {cfg['min_sources']}+\n\n"
+                             f"_راح يصلك تنبيه فقط لما يلقى إشارة قوية._\n"
+                             f"_لو ما وصلك شيء = مافي إشارات تطابق المعايير حالياً._",
+                        parse_mode="Markdown",
+                    )
+                    await q.answer("✅ المسح التلقائي مفعّل", show_alert=False)
+                else:
+                    disable_auto_scan(c, chat_id)
+                    cfg["auto_scan"] = False
+                    await c.bot.send_message(
+                        chat_id=chat_id,
+                        text="🔴 *المسح التلقائي: معطّل*\n\n"
+                             "_استخدم زر 🔍 مسح الآن للمسح اليدوي._",
+                        parse_mode="Markdown",
+                    )
+                    await q.answer("🔴 المسح التلقائي معطّل", show_alert=False)
+            except Exception as e:
+                log.warning("autoscan_toggle_error", err=str(e))
+                await c.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ خطأ في تشغيل المسح التلقائي:\n`{type(e).__name__}: {e}`",
+                    parse_mode="Markdown",
+                )
 
         elif data == "set:mode":
             await q.edit_message_text("اختر الوضع:", reply_markup=mode_keyboard())
