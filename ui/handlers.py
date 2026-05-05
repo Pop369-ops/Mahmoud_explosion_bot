@@ -331,6 +331,35 @@ async def cmd_backtest(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ خطأ: {type(e).__name__}: {e}")
 
 
+async def cmd_scan_history(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Retroactively scan past N hours. /scan_history [hours] [top_n]"""
+    from scanner.retroactive import scan_market_history, render_history_report
+    parts = u.message.text.split()
+    hours = 4
+    top_n = 50
+    if len(parts) > 1:
+        try:
+            hours = max(1, min(24, int(parts[1])))
+        except ValueError:
+            pass
+    if len(parts) > 2:
+        try:
+            top_n = max(20, min(100, int(parts[2])))
+        except ValueError:
+            pass
+    msg = await u.message.reply_text(
+        f"🔍 جاري فحص آخر {hours} ساعات على top {top_n} عملة...\n"
+        f"قد يأخذ 60-120 ثانية"
+    )
+    try:
+        report = await scan_market_history(top_n=top_n, hours_back=hours)
+        text = render_history_report(report)
+        # Plain text — no Markdown
+        await msg.edit_text(text)
+    except Exception as e:
+        await msg.edit_text(f"❌ خطأ: {type(e).__name__}: {e}")
+
+
 async def cmd_sentiment(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Show market sentiment + options + on-chain summary."""
     from risk.sentiment import analyze_sentiment

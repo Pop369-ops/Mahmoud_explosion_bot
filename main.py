@@ -106,7 +106,7 @@ def main():
         cmd_start, cmd_help, cmd_menu, cmd_status,
         cmd_settings, cmd_scan, cmd_test,
         cmd_capital, cmd_risk, cmd_perf, cmd_pause, cmd_resume,
-        cmd_backtest, cmd_sentiment,
+        cmd_backtest, cmd_sentiment, cmd_scan_history,
     )
     from ui.callback_handlers import handle_callback
 
@@ -135,6 +135,7 @@ def main():
     # Advanced analytics
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
+    app.add_handler(CommandHandler("scan_history", cmd_scan_history))
 
     # Callbacks (inline buttons)
     app.add_handler(CallbackQueryHandler(handle_callback))
