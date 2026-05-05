@@ -107,6 +107,7 @@ def main():
         cmd_settings, cmd_scan, cmd_test,
         cmd_capital, cmd_risk, cmd_perf, cmd_pause, cmd_resume,
         cmd_backtest, cmd_sentiment, cmd_scan_history,
+        cmd_trades, cmd_clear_trades,
     )
     from ui.callback_handlers import handle_callback
 
@@ -126,6 +127,9 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("test", cmd_test))
+    # Trade management
+    app.add_handler(CommandHandler("trades", cmd_trades))
+    app.add_handler(CommandHandler("clear_trades", cmd_clear_trades))
     # Risk management
     app.add_handler(CommandHandler("capital", cmd_capital))
     app.add_handler(CommandHandler("risk", cmd_risk))

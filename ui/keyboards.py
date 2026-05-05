@@ -14,6 +14,40 @@ def signal_keyboard(symbol: str, ai_enabled: bool = True) -> InlineKeyboardMarku
     return InlineKeyboardMarkup([row1, row2])
 
 
+def trades_list_keyboard(trades: dict) -> InlineKeyboardMarkup:
+    """Show all open trades with close buttons + clear all option."""
+    rows = []
+    if not trades:
+        rows.append([InlineKeyboardButton("لا توجد صفقات مفتوحة", callback_data="noop")])
+    else:
+        # One row per trade: close button + symbol info
+        for symbol in list(trades.keys())[:10]:  # max 10
+            rows.append([
+                InlineKeyboardButton(
+                    f"🗑 إغلاق {symbol}",
+                    callback_data=f"force_close:{symbol}",
+                ),
+            ])
+        # Clear all button if multiple trades
+        if len(trades) > 1:
+            rows.append([
+                InlineKeyboardButton(
+                    f"🗑️🗑️ مسح كل الصفقات ({len(trades)})",
+                    callback_data="clear_all_trades",
+                ),
+            ])
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="cmd:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def confirm_clear_keyboard() -> InlineKeyboardMarkup:
+    """Confirmation for clear all trades."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نعم، احذف الكل", callback_data="confirm_clear_yes"),
+         InlineKeyboardButton("❌ إلغاء", callback_data="confirm_clear_no")],
+    ])
+
+
 def exit_keyboard(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ تم الخروج", callback_data=f"closed:{symbol}"),

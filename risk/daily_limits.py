@@ -79,6 +79,14 @@ class DailyRiskManager:
         st = self.get(chat_id)
         now = now_riyadh()
 
+        # Sync open_trades_count from actual state (safety net)
+        try:
+            from core.state import state as user_state
+            actual_trades = user_state.get_trades(chat_id)
+            st.open_trades_count = len(actual_trades)
+        except Exception:
+            pass
+
         if st.capital <= 0:
             return RiskCheckResult(
                 allowed=False,
@@ -141,8 +149,10 @@ class DailyRiskManager:
                 allowed=False,
                 reason=(
                     f"🚫 لديك {st.open_trades_count} صفقات مفتوحة "
-                    f"(الحد الأقصى {st.max_concurrent_trades}). "
-                    f"أغلق صفقة قبل فتح أخرى."
+                    f"(الحد الأقصى {st.max_concurrent_trades}).\n\n"
+                    f"💡 *الخيارات:*\n"
+                    f"• `/trades` - عرض الصفقات المفتوحة\n"
+                    f"• `/clear_trades` - مسح كل الصفقات من البوت"
                 ),
             )
 

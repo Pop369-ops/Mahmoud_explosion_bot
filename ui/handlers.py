@@ -13,9 +13,13 @@ WELCOME = """🚀 *EXPLOSION_BOT v4 — ICT Pro*
 *الأوامر الأساسية:*
 /scan - مسح الآن
 /test SYMBOL - اختبر رمز محدد
-/status - حالة البوت + صفقاتك
+/status - حالة البوت
 /menu - القائمة الرئيسية
 /settings - الإعدادات
+
+*إدارة الصفقات:* 📈
+/trades - عرض الصفقات المفتوحة
+/clear\\_trades - مسح كل الصفقات
 
 *إدارة المخاطر:* 💰
 /capital 10000 - حدد رأس مالك
@@ -27,6 +31,7 @@ WELCOME = """🚀 *EXPLOSION_BOT v4 — ICT Pro*
 *التحليل المتقدم:* 📊
 /sentiment - معنويات السوق + خيارات BTC/ETH
 /backtest BTCUSDT 14 - اختبار خلفي
+/scan\\_history 4 - فحص الفرص في آخر ساعات
 
 ⚠️ _للأغراض التعليمية فقط_
 """
@@ -77,6 +82,83 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     last = state.get_last_results(chat_id)
     msg = build_status_message(chat_id, trades, last)
     await u.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_trades(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show all open trades with management buttons."""
+    from ui.keyboards import trades_list_keyboard
+    chat_id = u.effective_chat.id
+    trades = state.get_trades(chat_id)
+
+    if not trades:
+        await u.message.reply_text(
+            "📈 *صفقاتي المفتوحة*\n\n"
+            "لا توجد صفقات مفتوحة حالياً.\n\n"
+            "_البوت سيرسل لك إشارات جديدة عند توفرها._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Build detailed list
+    msg = f"📈 *صفقاتي المفتوحة ({len(trades)})*\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Get current prices to compute live P&L
+    from data_sources.binance import binance
+    for i, (symbol, trade) in enumerate(list(trades.items()), 1):
+        msg += f"*{i}. {symbol}*\n"
+        msg += f"  💰 الدخول: `${trade.entry:.6g}`\n"
+        msg += f"  🔴 SL: `${trade.sl:.6g}`\n"
+        msg += f"  🎯 TP1: `${trade.tp1:.6g}`\n"
+
+        try:
+            df = await binance.fetch_klines(symbol, "5m", 2)
+            if df is not None and len(df) > 0:
+                current = float(df["c"].iloc[-1])
+                pnl_pct = (current - trade.entry) / trade.entry * 100
+                pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                msg += f"  {pnl_emoji} الحالي: `${current:.6g}` ({pnl_pct:+.2f}%)\n"
+        except Exception:
+            pass
+
+        msg += f"  ⏱ منذ: {trade.opened_at.strftime('%H:%M %d/%m')}\n\n"
+
+    msg += "_اضغط زر الإغلاق لمسح صفقة من البوت._\n"
+    msg += "_(لا يغلق الصفقة فعلياً في Binance)_"
+
+    await u.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=trades_list_keyboard(trades),
+    )
+
+
+async def cmd_clear_trades(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Quick command to clear all open trades."""
+    from ui.keyboards import confirm_clear_keyboard
+    chat_id = u.effective_chat.id
+    trades = state.get_trades(chat_id)
+
+    if not trades:
+        await u.message.reply_text(
+            "✅ لا توجد صفقات مفتوحة.",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbols = ", ".join(list(trades.keys())[:5])
+    if len(trades) > 5:
+        symbols += f", +{len(trades)-5} أخرى"
+
+    await u.message.reply_text(
+        f"⚠️ *تأكيد المسح*\n\n"
+        f"عندك *{len(trades)} صفقة مفتوحة:*\n"
+        f"`{symbols}`\n\n"
+        f"المسح يحذفهم من تتبع البوت فقط، ولا يؤثر على Binance.\n\n"
+        f"تأكد إن صفقاتك الفعلية على Binance مغلقة قبل المسح.",
+        parse_mode="Markdown",
+        reply_markup=confirm_clear_keyboard(),
+    )
 
 
 async def cmd_settings(u: Update, c: ContextTypes.DEFAULT_TYPE):

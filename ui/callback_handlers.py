@@ -82,14 +82,110 @@ async def handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
                                        reply_markup=settings_keyboard(cfg))
 
         elif data == "cmd:trades":
+            from ui.keyboards import trades_list_keyboard
+            from data_sources.binance import binance
             trades = state.get_trades(chat_id)
             if not trades:
-                await q.message.reply_text("📭 لا صفقات مفتوحة")
+                await q.message.reply_text(
+                    "📈 لا توجد صفقات مفتوحة حالياً.",
+                )
             else:
-                msg = "📈 *صفقاتك المفتوحة:*\n\n"
-                for sym, t in trades.items():
-                    msg += f"• *{sym}*: P/L `{t.pnl_pct:+.2f}%`\n"
-                await q.message.reply_text(msg, parse_mode="Markdown")
+                msg = f"📈 *صفقاتي المفتوحة ({len(trades)})*\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                for i, (symbol, trade) in enumerate(list(trades.items()), 1):
+                    msg += f"*{i}. {symbol}*\n"
+                    msg += f"  💰 الدخول: `${trade.entry:.6g}`\n"
+                    msg += f"  🔴 SL: `${trade.sl:.6g}`\n"
+                    try:
+                        df = await binance.fetch_klines(symbol, "5m", 2)
+                        if df is not None and len(df) > 0:
+                            current = float(df["c"].iloc[-1])
+                            pnl_pct = (current - trade.entry) / trade.entry * 100
+                            pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                            msg += f"  {pnl_emoji} الحالي: `${current:.6g}` ({pnl_pct:+.2f}%)\n"
+                    except Exception:
+                        pass
+                    msg += "\n"
+                msg += "_اضغط زر الإغلاق لمسح صفقة من البوت._"
+                await q.message.reply_text(
+                    msg,
+                    parse_mode="Markdown",
+                    reply_markup=trades_list_keyboard(trades),
+                )
+
+        elif data.startswith("force_close:"):
+            sym = data.split(":", 1)[1]
+            trades = state.get_trades(chat_id)
+            if sym in trades:
+                trade = trades[sym]
+                try:
+                    from data_sources.binance import binance
+                    from trading.manager import record_trade_close
+                    df = await binance.fetch_klines(sym, "5m", 2)
+                    exit_price = (
+                        float(df["c"].iloc[-1])
+                        if df is not None and len(df) > 0
+                        else trade.entry
+                    )
+                    await record_trade_close(chat_id, trade, exit_price, "manual_force_close")
+                except Exception as e:
+                    log.warning("force_close_record_error", err=str(e))
+                await state.remove_trade(chat_id, sym)
+                await q.answer(f"✅ تم حذف {sym} من البوت", show_alert=True)
+                # Refresh the trades list
+                from ui.keyboards import trades_list_keyboard
+                remaining = state.get_trades(chat_id)
+                if remaining:
+                    msg = f"📈 *صفقات متبقية ({len(remaining)}):*\n\n"
+                    for s in remaining.keys():
+                        msg += f"• {s}\n"
+                    await q.edit_message_text(
+                        msg,
+                        parse_mode="Markdown",
+                        reply_markup=trades_list_keyboard(remaining),
+                    )
+                else:
+                    await q.edit_message_text("✅ تم مسح كل الصفقات.")
+            else:
+                await q.answer("❌ الصفقة غير موجودة")
+
+        elif data == "clear_all_trades":
+            from ui.keyboards import confirm_clear_keyboard
+            trades = state.get_trades(chat_id)
+            if not trades:
+                await q.answer("لا صفقات لحذفها")
+            else:
+                await q.edit_message_text(
+                    f"⚠️ *تأكيد المسح*\n\n"
+                    f"سيتم حذف *{len(trades)} صفقة* من تتبع البوت.\n\n"
+                    f"⚠️ هذا لا يغلق صفقاتك الفعلية على Binance — "
+                    f"تأكد من إغلاقها يدوياً هناك أولاً.",
+                    parse_mode="Markdown",
+                    reply_markup=confirm_clear_keyboard(),
+                )
+
+        elif data == "confirm_clear_yes":
+            trades = state.get_trades(chat_id)
+            count = len(trades)
+            for sym in list(trades.keys()):
+                await state.remove_trade(chat_id, sym)
+            try:
+                from risk.daily_limits import risk_manager
+                rs = risk_manager.get(chat_id)
+                rs.open_trades_count = 0
+            except Exception:
+                pass
+            await q.edit_message_text(
+                f"✅ تم مسح *{count} صفقة* من البوت.\n\n"
+                f"الإشارات الجديدة ستصل لك الآن.",
+                parse_mode="Markdown",
+            )
+
+        elif data == "confirm_clear_no":
+            await q.edit_message_text("❌ تم الإلغاء.")
+
+        elif data == "noop":
+            await q.answer()
 
         elif data == "cmd:autoscan_toggle":
             from scanner.orchestrator import enable_auto_scan, disable_auto_scan
