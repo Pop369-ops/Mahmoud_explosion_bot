@@ -147,20 +147,25 @@ async def run_scan_for_user(chat_id: int, bot: Bot, send_alerts: bool = True) ->
 
 async def _dispatch_alert(chat_id: int, sig: Signal, snap: MarketSnapshot, bot: Bot):
     """Send alert message + cache pending signal for button callbacks."""
-    # ─── Risk gate: don't bother user if they're paused/limited ──
+    # ─── Risk gate: only block alerts for ACTUAL risk limits (not missing capital) ──
     from risk.daily_limits import risk_manager
     risk_check = risk_manager.can_take_trade(chat_id)
-    if not risk_check.allowed:
-        # Send only ONE consolidated message per cooldown period (caller throttles via state.in_cooldown)
-        if risk_check.reason and "لم تحدد رأس المال" not in risk_check.reason:
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚫 *إشارة جيدة لـ {sig.symbol} لكن:*\n\n{risk_check.reason}",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+
+    # Special case: if capital not set, still send the alert (just without position sizing)
+    capital_not_set = (
+        risk_check.reason and "لم تحدد رأس المال" in risk_check.reason
+    )
+
+    if not risk_check.allowed and not capital_not_set:
+        # Real risk limit hit (daily loss, weekly loss, cooldown, etc) — block alert
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🚫 *إشارة جيدة لـ {sig.symbol} لكن:*\n\n{risk_check.reason}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
         log.info("alert_blocked_by_risk", chat=chat_id, symbol=sig.symbol,
                  reason=risk_check.reason)
         return
@@ -189,6 +194,18 @@ async def _dispatch_alert(chat_id: int, sig: Signal, snap: MarketSnapshot, bot: 
             chat_id=chat_id, text=msg,
             parse_mode="Markdown", reply_markup=kb,
         )
+        # If capital wasn't set, send a friendly reminder (max once per 6 hours)
+        if capital_not_set and state.should_remind_capital(chat_id):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💡 *لتظهر معك حسابات حجم المركز في الإشارات:*\n"
+                    "أرسل: `/capital 1000`\n"
+                    "(غيّر 1000 إلى رأس مالك بالدولار)"
+                ),
+                parse_mode="Markdown",
+            )
+            state.mark_capital_reminded(chat_id)
     except Exception as e:
         log.warning("alert_send_error", err=str(e), symbol=sig.symbol)
 

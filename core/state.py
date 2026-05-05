@@ -14,7 +14,16 @@ class StateManager:
         self._user_cfg: dict[int, dict] = {}
         self._last_results: dict[int, list] = {}
         self._pending_signals: dict[int, dict[str, dict]] = {}
+        self._capital_reminded: dict[int, float] = {}  # chat_id -> last reminder timestamp
         self._lock = asyncio.Lock()
+
+    def should_remind_capital(self, chat_id: int, cooldown_hours: int = 6) -> bool:
+        """Has the capital reminder NOT been sent in last N hours?"""
+        last = self._capital_reminded.get(chat_id, 0)
+        return (time.time() - last) > (cooldown_hours * 3600)
+
+    def mark_capital_reminded(self, chat_id: int):
+        self._capital_reminded[chat_id] = time.time()
 
     async def add_trade(self, trade: Trade):
         async with self._lock:
