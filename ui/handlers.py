@@ -102,6 +102,7 @@ async def cmd_scan(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     from scanner.orchestrator import scan_single_symbol
+    from core.models import Phase
     chat_id = u.effective_chat.id
     parts = u.message.text.split()
     symbol = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
@@ -109,13 +110,73 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
         symbol += "USDT"
     msg = await u.message.reply_text(f"🔍 تحليل {symbol}...")
     try:
-        sig = await scan_single_symbol(chat_id, symbol, c.bot, send_alert=True)
-        if sig and sig.phase.value != "none":
-            await msg.delete()
+        sig = await scan_single_symbol(chat_id, symbol, c.bot, send_alert=False)
+
+        if sig is None:
+            await msg.edit_text(f"❌ {symbol}: لم يتمكن من جلب البيانات")
+            return
+
+        # Build informative report regardless of phase
+        report = f"📊 تحليل {symbol}\n"
+        report += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        report += f"💰 السعر: ${sig.price:.6g}\n"
+        report += f"📊 24h: {sig.change_24h:+.2f}%\n"
+        report += f"🎯 Confidence: {sig.confidence}/100\n"
+        report += f"🛡 المصادر المتفقة: {sig.sources_agreed}/{sig.sources_total}\n\n"
+
+        # Show top verdict scores
+        if sig.verdicts:
+            report += "📡 المصادر:\n"
+            verdict_names = {
+                "volume_delta": "حجم الشراء",
+                "order_book": "دفتر الأوامر",
+                "funding_divergence": "Funding",
+                "whale_flow": "الحيتان",
+                "squeeze_breakout": "Squeeze",
+                "pre_explosion": "تراكم مبكر",
+                "btc_trend": "BTC اتجاه",
+                "btc_correlation": "BTC ارتباط",
+                "liquidity": "السيولة",
+                "multi_timeframe": "Multi-TF",
+            }
+            for v in sig.verdicts:
+                if v.confidence < 0.2:
+                    continue
+                emoji = "🟢" if v.score >= 65 else "🔴" if v.score < 40 else "⚪"
+                name = verdict_names.get(v.name, v.name)
+                report += f"  {emoji} {name}: {v.score}/100\n"
+            report += "\n"
+
+        # Phase outcome
+        if sig.phase == Phase.REJECTED:
+            report += f"🚫 مرفوضة بواسطة HARD GATE\n"
+            if sig.rejected_reason:
+                report += f"السبب: {sig.rejected_reason}\n"
+        elif sig.phase == Phase.NONE:
+            report += "⚪ لا إشارة (Confidence أو المصادر تحت العتبة)\n"
+            if sig.confidence < 50:
+                report += f"  (يحتاج confidence >= 50 + sources >= 3)\n"
         else:
-            await msg.edit_text(f"✅ {symbol}: لا إشارة قوية (confidence: {sig.confidence if sig else 'N/A'})")
+            report += f"✅ إشارة: {sig.phase.value}\n"
+            report += f"الدخول: ${sig.entry:.6g}\n"
+            report += f"SL: ${sig.sl:.6g} ({sig.sl_pct:.2f}%)\n"
+            report += f"TP1: ${sig.tp1:.6g}\n"
+            # Send full alert too
+            from ui.alerts import build_entry_alert
+            full_msg = build_entry_alert(sig, chat_id=chat_id)
+            await msg.delete()
+            await u.message.reply_text(full_msg, parse_mode="Markdown")
+            return
+
+        # Show warnings if any
+        if sig.warnings:
+            report += "\n⚠️ تحذيرات:\n"
+            for w in sig.warnings[:3]:
+                report += f"  {w}\n"
+
+        await msg.edit_text(report)
     except Exception as e:
-        await msg.edit_text(f"❌ {e}")
+        await msg.edit_text(f"❌ {type(e).__name__}: {e}")
 
 
 # ════════════════════════════════════════════════════════
@@ -259,14 +320,15 @@ async def cmd_backtest(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pass
     msg = await u.message.reply_text(
         f"🔬 جاري الـ backtest لـ {symbol} على آخر {days} يوم...\n"
-        f"_قد يأخذ 30-60 ثانية_"
+        f"قد يأخذ 30-60 ثانية"
     )
     try:
         report = await backtest_symbol(symbol, days=days, mode="day")
         text = render_backtest(report)
-        await msg.edit_text(text, parse_mode="Markdown")
+        # Use plain text — no Markdown parsing
+        await msg.edit_text(text)
     except Exception as e:
-        await msg.edit_text(f"❌ خطأ: {e}")
+        await msg.edit_text(f"❌ خطأ: {type(e).__name__}: {e}")
 
 
 async def cmd_sentiment(u: Update, c: ContextTypes.DEFAULT_TYPE):
