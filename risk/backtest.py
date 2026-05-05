@@ -294,22 +294,24 @@ async def backtest_top_symbols(top_n: int = 10, days: int = 14,
 
 def render_backtest(report: BacktestReport) -> str:
     if report.trades_opened == 0:
-        return f"📊 *Backtest {report.symbol}*\n_لا توجد إشارات في فترة {report.period}_"
+        return (f"📊 Backtest {report.symbol}\n"
+                f"لا توجد إشارات في فترة {report.period}\n"
+                f"المسح فحص {report.total_signals} إشارة محتملة لكن HARD GATE رفضها كلها.")
 
     pnl_emoji = "🟢" if report.total_pnl_pct >= 0 else "🔴"
-    m = f"📊 *Backtest {report.symbol}* ({report.period})\n"
+    m = f"📊 Backtest {report.symbol} ({report.period})\n"
     m += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    m += f"{pnl_emoji} مجموع P&L: `{report.total_pnl_pct:+.2f}%`\n"
-    m += f"📈 صفقات: {report.trades_opened} ({report.winners}✅/{report.losers}❌)\n"
-    m += f"🎯 Win Rate: `{report.win_rate}%`\n"
-    m += f"💰 PF: `{report.profit_factor:.2f}` | "
-    m += f"Expectancy: `{report.expectancy:+.2f}%`\n"
-    m += f"  Avg Win: `+{report.avg_win_pct:.2f}%` | "
-    m += f"Avg Loss: `{report.avg_loss_pct:.2f}%`\n"
+    m += f"{pnl_emoji} مجموع P-L: {report.total_pnl_pct:+.2f}%\n"
+    m += f"📈 صفقات: {report.trades_opened} (winners: {report.winners} / losers: {report.losers})\n"
+    m += f"🎯 Win Rate: {report.win_rate}%\n"
+    m += f"💰 Profit Factor: {report.profit_factor:.2f}\n"
+    m += f"📊 Expectancy: {report.expectancy:+.2f}% per trade\n"
+    m += f"  • Avg Win: +{report.avg_win_pct:.2f}%\n"
+    m += f"  • Avg Loss: {report.avg_loss_pct:.2f}%\n"
 
     if report.by_setup:
-        m += "\n*حسب النوع:*\n"
+        m += "\nحسب النوع:\n"
         for setup, d in sorted(report.by_setup.items(),
                                 key=lambda x: x[1]["pnl"], reverse=True):
-            m += f"  {setup}: {d['total']} | {d['win_rate']}% | `{d['pnl']:+.2f}%`\n"
+            m += f"  • {setup}: {d['total']} trades | {d['win_rate']}% | {d['pnl']:+.2f}%\n"
     return m
