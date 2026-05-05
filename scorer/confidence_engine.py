@@ -236,6 +236,46 @@ def _apply_hard_gate(sig: Signal, snap: MarketSnapshot, direction: str):
                 f"لا يوجد دعم اتجاهي قوي"
             )
 
+    # ─── Gate 6: NO liquidity above/below + premium/discount + extended move
+    # Buying near top with no clear TP target = stop hunt magnet
+    no_liquidity_warning = any(
+        ("لا توجد سيولة فوق" in w or "لا توجد سيولة تحت" in w
+         or "لا توجد قمم سيولة" in w or "لا توجد قيعان سيولة" in w)
+        for w in sig.warnings
+    )
+    if no_liquidity_warning:
+        # Combined with extended 24h move (>5%) → high reversal risk
+        if abs(sig.change_24h) >= 5.0:
+            rejections.append(
+                f"لا توجد سيولة في اتجاه الصفقة + حركة 24h ممتدة "
+                f"({sig.change_24h:+.1f}%) — احتمال انعكاس مرتفع"
+            )
+        # Or in premium/discount conflict zone
+        elif snap.htf_bias and snap.htf_bias.daily:
+            zone = snap.htf_bias.daily.zone
+            if direction == "long" and zone == "premium":
+                rejections.append(
+                    "لا توجد سيولة فوق + السعر في premium زون — شراء فوق القمة"
+                )
+            elif direction == "short" and zone == "discount":
+                rejections.append(
+                    "لا توجد سيولة تحت + السعر في discount زون — بيع تحت القاع"
+                )
+
+    # ─── Gate 7: BTC correlation/trend both very weak (< 50)
+    # Means this trade has zero macro support — purely isolated
+    btc_trend_v = next((v for v in sig.verdicts if v.name == "btc_trend"), None)
+    btc_corr_v = next((v for v in sig.verdicts if v.name == "btc_correlation"), None)
+    if btc_trend_v and btc_corr_v:
+        if (btc_trend_v.score < 55 and btc_corr_v.score < 55
+            and btc_trend_v.confidence >= 0.4 and btc_corr_v.confidence >= 0.4):
+            # Only reject if combined with weak overall structure
+            if sig.sources_agreed < 6 and abs(sig.change_24h) >= 5.0:
+                rejections.append(
+                    f"BTC اتجاه/ارتباط ضعيف ({btc_trend_v.score}/{btc_corr_v.score}) "
+                    f"+ حركة 24h ممتدة — لا يوجد دعم ماكرو"
+                )
+
     # ─── Apply rejection ─────────────────────────────────
     if rejections:
         sig.phase = Phase.REJECTED
