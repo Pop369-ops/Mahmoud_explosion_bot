@@ -165,15 +165,17 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
                      mode: str = "day") -> LiquidityPlan:
     atr = compute_atr(df) or price * 0.005
 
+    # ─── Increased buffers to protect from stop hunts ──
+    # Old buffers were too tight — market makers easily wicked through
     if mode == "scalp":
-        lookback, buffer_atr_mult = 30, 0.4
+        lookback, buffer_atr_mult = 30, 0.6   # was 0.4
     elif mode == "swing":
-        lookback, buffer_atr_mult = 100, 0.7
+        lookback, buffer_atr_mult = 100, 1.0  # was 0.7
     else:
-        lookback, buffer_atr_mult = 50, 0.5
+        lookback, buffer_atr_mult = 50, 0.8   # was 0.5
 
-    sl_min_pct = {"scalp": 0.5, "day": 0.8, "swing": 1.5}[mode]
-    sl_max_pct = {"scalp": 2.0, "day": 4.0, "swing": 7.0}[mode]
+    sl_min_pct = {"scalp": 0.6, "day": 1.0, "swing": 1.8}[mode]   # was 0.5/0.8/1.5
+    sl_max_pct = {"scalp": 2.5, "day": 5.0, "swing": 8.0}[mode]   # was 2.0/4.0/7.0
 
     obs = find_order_blocks(df, lookback=lookback)
     bullish_obs = find_active_obs_for_long(obs, price)
@@ -192,12 +194,24 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
     sl_logic = ""
     method = "atr_fallback"
 
+    # ─── Stop Hunt Protection ─────────────────────────
+    # Look at recent candle wicks to estimate "wick spike" size
+    # If recent low has long wicks below, we need wider buffer
+    recent_lows = df["l"].astype(float).values[-15:]
+    recent_closes = df["c"].astype(float).values[-15:]
+    recent_opens = df["o"].astype(float).values[-15:]
+    avg_lower_wick = sum(
+        max(0, min(o, c) - l) for o, c, l in zip(recent_opens, recent_closes, recent_lows)
+    ) / max(len(recent_lows), 1)
+    # Spike protection: SL must be below typical wick range
+    spike_buffer = avg_lower_wick * 1.3  # 30% extra to be safe
+
     # P1: Sweep
     if bullish_sweep and bullish_sweep.is_recent:
         sweep_low = bullish_sweep.sweep_extreme
         dist_pct = (price - sweep_low) / price * 100
         if sl_min_pct <= dist_pct <= sl_max_pct:
-            buffer = atr * buffer_atr_mult * 0.6
+            buffer = max(atr * buffer_atr_mult * 0.8, spike_buffer)  # was 0.6, no spike
             sl = sweep_low - buffer
             sl_logic = (f"تحت Sweep low @ ${sweep_low:.6g} "
                         f"(rejection {bullish_sweep.rejection_pct*100:.0f}%, قوة {bullish_sweep.strength})")
@@ -208,7 +222,7 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
         for ob in bullish_obs:
             dist_pct = (price - ob.low) / price * 100
             if sl_min_pct <= dist_pct <= sl_max_pct and ob.bos_confirmed:
-                buffer = atr * buffer_atr_mult
+                buffer = max(atr * buffer_atr_mult, spike_buffer)
                 sl = ob.low - buffer
                 sl_logic = (f"تحت Order Block @ ${ob.low:.6g}-${ob.high:.6g} "
                             f"(displacement {ob.displacement:.1f}× ATR, BOS ✓)")
@@ -218,7 +232,7 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
             for ob in bullish_obs:
                 dist_pct = (price - ob.low) / price * 100
                 if sl_min_pct <= dist_pct <= sl_max_pct:
-                    buffer = atr * buffer_atr_mult
+                    buffer = max(atr * buffer_atr_mult, spike_buffer)
                     sl = ob.low - buffer
                     sl_logic = f"تحت Order Block @ ${ob.low:.6g}-${ob.high:.6g}"
                     method = "ict_standard"
@@ -229,7 +243,7 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
         nearest_fvg = fvgs_below[0]
         dist_pct = (price - nearest_fvg.bottom) / price * 100
         if sl_min_pct <= dist_pct <= sl_max_pct:
-            buffer = atr * buffer_atr_mult * 0.7
+            buffer = max(atr * buffer_atr_mult * 0.9, spike_buffer)
             sl = nearest_fvg.bottom - buffer
             sl_logic = f"تحت FVG @ ${nearest_fvg.bottom:.6g}-${nearest_fvg.top:.6g}"
             method = "ict_standard"
@@ -241,7 +255,7 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
         for s in candidates:
             dist_pct = (price - s.price) / price * 100
             if sl_min_pct <= dist_pct <= sl_max_pct and s.strength >= 1:
-                buffer = atr * buffer_atr_mult
+                buffer = max(atr * buffer_atr_mult, spike_buffer)
                 sl = s.price - buffer
                 sl_logic = f"خلف swing low @ ${s.price:.6g} (قوة {s.strength})"
                 method = "liquidity"
@@ -254,14 +268,14 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
                                 and w.strength >= 2], key=lambda w: w.distance_pct)
         if strong_walls:
             wall = strong_walls[0]
-            buffer = atr * buffer_atr_mult
+            buffer = max(atr * buffer_atr_mult, spike_buffer)
             sl = wall.price - buffer
             sl_logic = f"خلف جدار شراء ${wall.price:.6g}"
             method = "liquidity"
 
-    # P6: ATR fallback
+    # P6: ATR fallback (now wider for protection)
     if sl == 0:
-        sl_atr_mult = {"scalp": 1.5, "day": 2.0, "swing": 2.5}[mode]
+        sl_atr_mult = {"scalp": 2.0, "day": 2.5, "swing": 3.0}[mode]  # was 1.5/2.0/2.5
         sl = price - (atr * sl_atr_mult)
         sl_logic = f"ATR fallback ({sl_atr_mult}× ATR) — لا توجد سيولة واضحة"
         warnings.append("⚠️ SL على ATR — احتمال stop hunt أعلى")
@@ -282,11 +296,11 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
                           if ob.kind == "bearish_ob" and ob.low > price and not ob.mitigated]
     bearish_obs_above.sort(key=lambda b: b.low)
     for ob in bearish_obs_above[:3]:
-        tp_targets.append((ob.low - (atr * 0.15), "OB"))
+        tp_targets.append((ob.low - (atr * 0.30), "OB"))
     for s in sorted([s for s in swing_highs if s.price > price], key=lambda s: s.price):
-        tp_targets.append((s.price - (atr * 0.15), "swing"))
+        tp_targets.append((s.price - (atr * 0.30), "swing"))
     for w in sorted([w for w in ask_walls if w.price > price], key=lambda w: w.price):
-        tp_price = w.price - (atr * 0.20)
+        tp_price = w.price - (atr * 0.35)
         if not any(abs(tp_price - t[0]) / max(tp_price, 1e-9) < 0.003 for t in tp_targets):
             tp_targets.append((tp_price, "wall"))
 
@@ -343,15 +357,16 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
                       mode: str = "day") -> LiquidityPlan:
     atr = compute_atr(df) or price * 0.005
 
+    # ─── Increased buffers to protect from stop hunts ──
     if mode == "scalp":
-        lookback, buffer_atr_mult = 30, 0.4
+        lookback, buffer_atr_mult = 30, 0.6   # was 0.4
     elif mode == "swing":
-        lookback, buffer_atr_mult = 100, 0.7
+        lookback, buffer_atr_mult = 100, 1.0  # was 0.7
     else:
-        lookback, buffer_atr_mult = 50, 0.5
+        lookback, buffer_atr_mult = 50, 0.8   # was 0.5
 
-    sl_min_pct = {"scalp": 0.5, "day": 0.8, "swing": 1.5}[mode]
-    sl_max_pct = {"scalp": 2.0, "day": 4.0, "swing": 7.0}[mode]
+    sl_min_pct = {"scalp": 0.6, "day": 1.0, "swing": 1.8}[mode]   # was 0.5/0.8/1.5
+    sl_max_pct = {"scalp": 2.5, "day": 5.0, "swing": 8.0}[mode]   # was 2.0/4.0/7.0
 
     obs = find_order_blocks(df, lookback=lookback)
     bearish_obs = find_active_obs_for_short(obs, price)
@@ -370,11 +385,20 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
     sl_logic = ""
     method = "atr_fallback"
 
+    # ─── Stop Hunt Protection (upper wick) ──
+    recent_highs = df["h"].astype(float).values[-15:]
+    recent_closes = df["c"].astype(float).values[-15:]
+    recent_opens = df["o"].astype(float).values[-15:]
+    avg_upper_wick = sum(
+        max(0, h - max(o, c)) for o, c, h in zip(recent_opens, recent_closes, recent_highs)
+    ) / max(len(recent_highs), 1)
+    spike_buffer = avg_upper_wick * 1.3
+
     if bearish_sweep and bearish_sweep.is_recent:
         sweep_high = bearish_sweep.sweep_extreme
         dist_pct = (sweep_high - price) / price * 100
         if sl_min_pct <= dist_pct <= sl_max_pct:
-            buffer = atr * buffer_atr_mult * 0.6
+            buffer = max(atr * buffer_atr_mult * 0.8, spike_buffer)
             sl = sweep_high + buffer
             sl_logic = (f"فوق Sweep high @ ${sweep_high:.6g} "
                         f"(rejection {bearish_sweep.rejection_pct*100:.0f}%)")
@@ -384,7 +408,7 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
         for ob in bearish_obs:
             dist_pct = (ob.high - price) / price * 100
             if sl_min_pct <= dist_pct <= sl_max_pct and ob.bos_confirmed:
-                buffer = atr * buffer_atr_mult
+                buffer = max(atr * buffer_atr_mult, spike_buffer)
                 sl = ob.high + buffer
                 sl_logic = (f"فوق Order Block @ ${ob.low:.6g}-${ob.high:.6g} "
                             f"(displacement {ob.displacement:.1f}× ATR, BOS ✓)")
@@ -394,7 +418,7 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
             for ob in bearish_obs:
                 dist_pct = (ob.high - price) / price * 100
                 if sl_min_pct <= dist_pct <= sl_max_pct:
-                    buffer = atr * buffer_atr_mult
+                    buffer = max(atr * buffer_atr_mult, spike_buffer)
                     sl = ob.high + buffer
                     sl_logic = f"فوق Order Block @ ${ob.low:.6g}-${ob.high:.6g}"
                     method = "ict_standard"
@@ -404,7 +428,7 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
         nearest = fvgs_above[0]
         dist_pct = (nearest.top - price) / price * 100
         if sl_min_pct <= dist_pct <= sl_max_pct:
-            buffer = atr * buffer_atr_mult * 0.7
+            buffer = max(atr * buffer_atr_mult * 0.9, spike_buffer)
             sl = nearest.top + buffer
             sl_logic = f"فوق FVG @ ${nearest.bottom:.6g}-${nearest.top:.6g}"
             method = "ict_standard"
@@ -414,7 +438,7 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
         for s in candidates:
             dist_pct = (s.price - price) / price * 100
             if sl_min_pct <= dist_pct <= sl_max_pct and s.strength >= 1:
-                buffer = atr * buffer_atr_mult
+                buffer = max(atr * buffer_atr_mult, spike_buffer)
                 sl = s.price + buffer
                 sl_logic = f"فوق swing high @ ${s.price:.6g}"
                 method = "liquidity"
@@ -426,13 +450,13 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
                                 and w.strength >= 2], key=lambda w: w.distance_pct)
         if strong_walls:
             wall = strong_walls[0]
-            buffer = atr * buffer_atr_mult
+            buffer = max(atr * buffer_atr_mult, spike_buffer)
             sl = wall.price + buffer
             sl_logic = f"فوق جدار بيع ${wall.price:.6g}"
             method = "liquidity"
 
     if sl == 0:
-        sl_atr_mult = {"scalp": 1.5, "day": 2.0, "swing": 2.5}[mode]
+        sl_atr_mult = {"scalp": 2.0, "day": 2.5, "swing": 3.0}[mode]  # was 1.5/2.0/2.5
         sl = price + (atr * sl_atr_mult)
         sl_logic = f"ATR fallback ({sl_atr_mult}× ATR)"
         warnings.append("⚠️ SL على ATR — احتمال stop hunt أعلى")
@@ -452,11 +476,11 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
                           if ob.kind == "bullish_ob" and ob.high < price and not ob.mitigated]
     bullish_obs_below.sort(key=lambda b: b.high, reverse=True)
     for ob in bullish_obs_below[:3]:
-        tp_targets.append((ob.high + (atr * 0.15), "OB"))
+        tp_targets.append((ob.high + (atr * 0.30), "OB"))
     for s in sorted([s for s in swing_lows if s.price < price], key=lambda s: s.price, reverse=True):
-        tp_targets.append((s.price + (atr * 0.15), "swing"))
+        tp_targets.append((s.price + (atr * 0.30), "swing"))
     for w in sorted([w for w in bid_walls if w.price < price], key=lambda w: w.price, reverse=True):
-        tp_price = w.price + (atr * 0.20)
+        tp_price = w.price + (atr * 0.35)
         if not any(abs(tp_price - t[0]) / max(tp_price, 1e-9) < 0.003 for t in tp_targets):
             tp_targets.append((tp_price, "wall"))
 
