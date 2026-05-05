@@ -405,6 +405,73 @@ def _apply_hard_gate(sig: Signal, snap: MarketSnapshot, direction: str):
                     f"+ حركة 24h ممتدة — لا يوجد دعم ماكرو"
                 )
 
+    # ─── Gate 8: Recovery scam — pump after dump ──────
+    # If 24h is meaningfully negative and we have a sudden buy spike,
+    # this is often a "dead cat bounce" or pump-and-dump trap
+    vol_v = next((v for v in sig.verdicts if v.name == "volume_delta"), None)
+    if direction == "long" and sig.change_24h <= -1.5:
+        if vol_v and vol_v.score >= 80:  # sudden buying spike
+            # Need confirmation from at least 2 other strong sources
+            other_strong = sum(
+                1 for v in sig.verdicts
+                if v.name not in ("volume_delta", "btc_trend", "btc_correlation",
+                                    "liquidity")
+                and v.score >= 65
+            )
+            if other_strong < 2:
+                rejections.append(
+                    f"شراء spike على عملة هابطة ({sig.change_24h:.1f}% / 24h) "
+                    f"— نمط pump محتمل"
+                )
+
+    # ─── Gate 9: Funding extremo against trade ────────
+    # If funding > 0.025% (longs crowded) and we want to LONG → squeeze risk
+    funding_v = next((v for v in sig.verdicts if v.name == "funding_divergence"), None)
+    if snap.funding_rate is not None:
+        funding_pct = snap.funding_rate * 100
+        if direction == "long" and funding_pct > 0.025:
+            # Longs are crowded, opening more = walking into squeeze
+            if sig.sources_agreed < 6:
+                rejections.append(
+                    f"Funding مرتفع ({funding_pct:.3f}%) — longs مكدسة، "
+                    f"خطر squeeze هابط"
+                )
+        elif direction == "short" and funding_pct < -0.025:
+            if sig.sources_agreed < 6:
+                rejections.append(
+                    f"Funding سالب جداً ({funding_pct:.3f}%) — shorts مكدسة، "
+                    f"خطر squeeze صاعد"
+                )
+
+    # ─── Gate 10: Low liquidity (low cap) protection ──
+    # Coins with < $100M 24h volume are highly manipulatable
+    if sig.volume_24h < 100_000_000:
+        # Require higher quality bar
+        if sig.confidence < 75 or sig.sources_agreed < 5:
+            rejections.append(
+                f"عملة منخفضة السيولة (${sig.volume_24h/1_000_000:.1f}M) — "
+                f"نحتاج إشارة أقوى (ثقة 75+ ومصادر 5+)"
+            )
+
+    # ─── Gate 11: Spike-only signal (false positives) ─
+    # If volume_delta is extreme but average of OTHER sources is weak,
+    # this is likely a manipulation spike, not real momentum
+    if vol_v and vol_v.score >= 90:
+        other_scores = [
+            v.score for v in sig.verdicts
+            if v.name not in ("volume_delta", "liquidity", "btc_trend",
+                                "btc_correlation")
+            and v.confidence >= 0.4
+        ]
+        if other_scores:
+            avg_others = sum(other_scores) / len(other_scores)
+            if avg_others < 60:
+                rejections.append(
+                    f"إشارة معتمدة على spike شراء فقط "
+                    f"(volume {vol_v.score}, متوسط الباقي {avg_others:.0f}) — "
+                    f"احتمال تلاعب"
+                )
+
     # ─── Apply rejection ─────────────────────────────────
     if rejections:
         sig.phase = Phase.REJECTED
