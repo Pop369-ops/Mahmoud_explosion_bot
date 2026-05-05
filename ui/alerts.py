@@ -57,6 +57,13 @@ def build_entry_alert(sig: Signal, rank: int = 1, chat_id: int = 0) -> str:
     m += f"💰 *TP2:* `${fmt(sig.tp2)}` _({tp2_pct:+.2f}%)_\n"
     m += f"🏆 *TP3:* `${fmt(sig.tp3)}` _({tp3_pct:+.2f}%)_\n\n"
 
+    # ─── Partial TP / Trailing strategy ─────────────────
+    m += "📋 *استراتيجية الخروج الموصى بها:*\n"
+    m += f"  • TP1 → اخرج *50%* + حرّك SL إلى Break-Even\n"
+    m += f"  • TP2 → اخرج *30%* + حرّك SL إلى TP1\n"
+    m += f"  • TP3 → اخرج آخر *20%* (الصفقة كاملة)\n"
+    m += f"  _البوت سيرسل لك تنبيهات في كل مرحلة._\n\n"
+
     # ─── Position sizing block ──
     if chat_id:
         try:

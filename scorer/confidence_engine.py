@@ -164,6 +164,86 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
     except (asyncio.TimeoutError, Exception) as e:
         log.debug("onchain_skip", err=str(e))
 
+    # ─── Volume Profile (advanced) ──
+    vp_summary = None
+    try:
+        from scorer.volume_profile import compute_volume_profile, render_vp_summary
+        # Use 1h or 4h klines for multi-day profile
+        vp_df = snap.klines_1h if snap.klines_1h is not None else snap.klines
+        if vp_df is not None and len(vp_df) >= 30:
+            vp = compute_volume_profile(vp_df, num_bins=40)
+            if vp is not None and vp.vpoc > 0:
+                snap.volume_profile = vp
+                vp_summary = render_vp_summary(vp)
+                # Score adjustment based on price-VPOC relationship
+                if direction == "long":
+                    if vp.in_value_area and vp.above_vpoc:
+                        confidence = min(100, confidence + 4)
+                    elif snap.price > vp.vah:
+                        confidence = max(0, confidence - 6)  # overbought
+                else:
+                    if vp.in_value_area and not vp.above_vpoc:
+                        confidence = min(100, confidence + 4)
+                    elif snap.price < vp.val:
+                        confidence = max(0, confidence - 6)
+    except Exception as e:
+        log.debug("vp_skip", err=str(e))
+
+    # ─── Order Flow (CVD divergence) ──
+    flow_summary = None
+    try:
+        from scorer.order_flow import analyze_order_flow
+        if snap.klines is not None and len(snap.klines) >= 30:
+            flow = analyze_order_flow(snap.klines)
+            snap.order_flow = flow
+            flow_summary = flow.summary_ar
+            # Divergence is a strong signal
+            if direction == "long":
+                if flow.bullish_divergence:
+                    confidence = min(100, confidence + 5 + flow.divergence_strength * 2)
+                if flow.bearish_divergence:
+                    confidence = max(0, confidence - 5 - flow.divergence_strength * 2)
+                if flow.score >= 65:
+                    confidence = min(100, confidence + 4)
+                elif flow.score <= 35:
+                    confidence = max(0, confidence - 4)
+            else:
+                if flow.bearish_divergence:
+                    confidence = min(100, confidence + 5 + flow.divergence_strength * 2)
+                if flow.bullish_divergence:
+                    confidence = max(0, confidence - 5 - flow.divergence_strength * 2)
+    except Exception as e:
+        log.debug("order_flow_skip", err=str(e))
+
+    # ─── Liquidation Zones ──
+    liq_summary = None
+    try:
+        from scorer.liquidation_zones import (
+            find_liquidation_zones, render_liquidation_summary,
+            find_danger_zones_for_long, find_danger_zones_for_short,
+        )
+        zones = find_liquidation_zones(
+            snap.price,
+            df_5m=snap.klines, df_1h=snap.klines_1h, df_1d=snap.klines_1d,
+        )
+        if zones:
+            snap.liquidation_zones = zones
+            # Warn if dangerous zone is very close
+            danger = (find_danger_zones_for_long(zones, snap.price)
+                       if direction == "long"
+                       else find_danger_zones_for_short(zones, snap.price))
+            close_danger = [z for z in danger if abs(z.distance_pct) < 1.5 and z.severity >= 3]
+            if close_danger:
+                z = close_danger[0]
+                sig.warnings.append(
+                    f"🔥 منطقة تصفية قريبة: {z.description_ar}"
+                )
+                # Slight penalty if liquidation zone is in trade direction
+                confidence = max(0, confidence - 3)
+            liq_summary = render_liquidation_summary(zones[:3])
+    except Exception as e:
+        log.debug("liq_zones_skip", err=str(e))
+
     all_signals: list[str] = []
     all_warnings: list[str] = []
     for verd in verdicts:
@@ -181,6 +261,12 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
         all_signals.append(f"😊 {sentiment_advisory}")
     if onchain_summary:
         all_signals.append(f"⛓ on-chain: {onchain_summary}")
+    if vp_summary:
+        all_signals.append(vp_summary)
+    if flow_summary:
+        all_signals.append(f"📊 Order Flow: {flow_summary}")
+    if liq_summary:
+        all_signals.append(f"🎯 مناطق التصفية:\n{liq_summary}")
 
     sig.confidence = confidence
     sig.sources_agreed = sources_agreed

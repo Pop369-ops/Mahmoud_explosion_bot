@@ -301,10 +301,20 @@ async def _on_track(q, chat_id: int, symbol: str):
             mode=Mode(pending.get("mode", "day")),
         )
         await open_trade_from_signal(chat_id, sig)
+        # Start trailing tracker
+        try:
+            from trading.trail_manager import trail_mgr
+            from core.models import Trade
+            trade_obj = state.get_trade(chat_id, symbol)
+            if trade_obj:
+                trail_mgr.start_tracking(chat_id, symbol, trade_obj, direction="long")
+        except Exception as e:
+            log.warning("trail_start_error", err=str(e))
         await state.remove_pending(chat_id, symbol)
         await q.answer("✅ بدأت المراقبة", show_alert=False)
         await q.edit_message_text(
-            q.message.text + "\n\n👁 *المراقبة بدأت — ستستلم تنبيه عند TP/SL*",
+            q.message.text + "\n\n👁 *المراقبة بدأت — ستستلم تنبيه عند TP/SL*\n"
+            "_(تحريك SL تلقائي إلى Break-Even عند TP1)_",
             parse_mode="Markdown",
         )
     except Exception as e:

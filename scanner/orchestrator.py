@@ -254,6 +254,41 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
         trades = state.get_trades(chat_id)
         for sym, trade in list(trades.items()):
             try:
+                # ─── Trailing manager check (TP1/TP2/TP3 + trailing SL) ──
+                try:
+                    from trading.trail_manager import trail_mgr
+                    df = await binance.fetch_klines(sym, "5m", 2)
+                    if df is not None and len(df) > 0:
+                        current = float(df["c"].iloc[-1])
+                        # Auto-start trailing if not yet tracked
+                        if trail_mgr.get(chat_id, sym) is None:
+                            trail_mgr.start_tracking(chat_id, sym, trade, "long")
+                        result = trail_mgr.update(chat_id, sym, current)
+                        for action in result.get("actions", []):
+                            try:
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=action["msg"],
+                                    parse_mode="Markdown",
+                                )
+                            except Exception as e:
+                                log.warning("trail_msg_error", err=str(e))
+                            if action.get("close"):
+                                # Record close + cleanup
+                                try:
+                                    from trading.manager import record_trade_close
+                                    reason = ("SL" if action["type"] == "sl_hit"
+                                                else action["type"])
+                                    await record_trade_close(chat_id, trade, current, reason)
+                                except Exception:
+                                    pass
+                                trail_mgr.stop_tracking(chat_id, sym)
+                                await state.remove_trade(chat_id, sym)
+                        if result.get("should_stop"):
+                            continue  # don't run analyze_exit on closed trades
+                except Exception as e:
+                    log.warning("trail_update_error", sym=sym, err=str(e))
+
                 ex = await analyze_exit(trade)
                 if ex["action"] != "hold" and ex.get("price", 0) > 0:
                     msg = build_exit_alert(trade, ex)
@@ -274,6 +309,11 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
                             )
                         except Exception as e:
                             log.warning("record_close_error", err=str(e))
+                        try:
+                            from trading.trail_manager import trail_mgr
+                            trail_mgr.stop_tracking(chat_id, sym)
+                        except Exception:
+                            pass
                         await state.remove_trade(chat_id, sym)
             except Exception as e:
                 log.warning("monitor_error", sym=sym, err=str(e))

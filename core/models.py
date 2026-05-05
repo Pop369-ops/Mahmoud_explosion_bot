@@ -85,6 +85,9 @@ class MarketSnapshot:
     whale_flow: Optional[dict] = None
     htf_bias: Optional[object] = None     # MultiTFBias (lazy fill)
     killzone: Optional[object] = None     # KillzoneInfo (lazy fill)
+    volume_profile: Optional[object] = None
+    order_flow: Optional[object] = None
+    liquidation_zones: Optional[list] = None
 
 
 @dataclass
