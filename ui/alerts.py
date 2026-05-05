@@ -45,9 +45,15 @@ def build_entry_alert(sig: Signal, rank: int = 1) -> str:
     m += "━━━━━━━━━━━━━━━━━━━━\n"
     m += f"🟢 *دخول:* `${fmt(sig.entry)}`\n"
     m += f"🔴 *SL:* `${fmt(sig.sl)}` _(-{sig.sl_pct:.1f}%)_\n"
-    m += f"💰 *TP1:* `${fmt(sig.tp1)}` _(+{sig.sl_pct*1.5:.1f}%)_\n"
-    m += f"💰 *TP2:* `${fmt(sig.tp2)}` _(+{sig.sl_pct*3:.1f}%)_\n"
-    m += f"🏆 *TP3:* `${fmt(sig.tp3)}` _(+{sig.sl_pct*5:.1f}%)_\n\n"
+
+    # Compute actual TP percentages
+    tp1_pct = (sig.tp1 - sig.entry) / sig.entry * 100 if sig.entry > 0 else 0
+    tp2_pct = (sig.tp2 - sig.entry) / sig.entry * 100 if sig.entry > 0 else 0
+    tp3_pct = (sig.tp3 - sig.entry) / sig.entry * 100 if sig.entry > 0 else 0
+
+    m += f"💰 *TP1:* `${fmt(sig.tp1)}` _({tp1_pct:+.2f}%)_\n"
+    m += f"💰 *TP2:* `${fmt(sig.tp2)}` _({tp2_pct:+.2f}%)_\n"
+    m += f"🏆 *TP3:* `${fmt(sig.tp3)}` _({tp3_pct:+.2f}%)_\n\n"
     m += f"🎮 _الوضع: {sig.mode.value}_ | ⚠️ _للأغراض التعليمية فقط_"
     return m
 

@@ -26,34 +26,39 @@ async def scan_single_symbol(chat_id: int, symbol: str, bot: Bot,
                               send_alert: bool = True) -> Optional[Signal]:
     """Scan one symbol, optionally send alert."""
     try:
-        # Fetch market data in parallel
-        klines, klines_15m, klines_1h, ob, fr_data = await asyncio.gather(
+        # Fetch all timeframes + OB + funding in parallel
+        results = await asyncio.gather(
             binance.fetch_klines(symbol, "5m", 80),
             binance.fetch_klines(symbol, "15m", 50),
-            binance.fetch_klines(symbol, "1h", 50),
+            binance.fetch_klines(symbol, "1h", 60),
+            binance.fetch_klines(symbol, "4h", 60),
+            binance.fetch_klines(symbol, "1d", 50),
             binance.fetch_order_book(symbol, 50),
             binance.fetch_funding_rate(symbol),
             return_exceptions=True,
         )
+        klines = results[0] if not isinstance(results[0], Exception) else None
+        klines_15m = results[1] if not isinstance(results[1], Exception) else None
+        klines_1h = results[2] if not isinstance(results[2], Exception) else None
+        klines_4h = results[3] if not isinstance(results[3], Exception) else None
+        klines_1d = results[4] if not isinstance(results[4], Exception) else None
+        ob = results[5] if not isinstance(results[5], Exception) else None
+        fr_data = results[6] if isinstance(results[6], dict) else None
 
-        if not isinstance(klines, type(None)) and klines is not None and len(klines) >= 30:
-            price = float(klines["c"].iloc[-1])
-            chg_24h = (price - float(klines["c"].iloc[-min(48, len(klines))])) / float(klines["c"].iloc[-min(48, len(klines))]) * 100
-        else:
+        if klines is None or len(klines) < 30:
             return None
 
-        # Use 24h ticker for accurate volume
-        # For single-symbol test, we'll use a derived volume
+        price = float(klines["c"].iloc[-1])
+        chg_24h = (price - float(klines["c"].iloc[-min(48, len(klines))])) / float(klines["c"].iloc[-min(48, len(klines))]) * 100
         vol_24h = float(klines["qv"].iloc[-min(288, len(klines)):].sum())
 
         snap = MarketSnapshot(
             symbol=symbol, price=price,
             volume_24h=vol_24h, change_24h=chg_24h,
-            klines=klines if not isinstance(klines, Exception) else None,
-            klines_15m=klines_15m if not isinstance(klines_15m, Exception) else None,
-            klines_1h=klines_1h if not isinstance(klines_1h, Exception) else None,
-            order_book=ob if not isinstance(ob, Exception) else None,
-            funding_rate=fr_data.get("funding_rate") if isinstance(fr_data, dict) else None,
+            klines=klines, klines_15m=klines_15m,
+            klines_1h=klines_1h, klines_4h=klines_4h,
+            klines_1d=klines_1d, order_book=ob,
+            funding_rate=fr_data.get("funding_rate") if fr_data else None,
         )
 
         cfg = state.get_user_cfg(chat_id)
@@ -87,18 +92,32 @@ async def run_scan_for_user(chat_id: int, bot: Bot, send_alerts: bool = True) ->
     async def _process(p: dict) -> Optional[Signal]:
         async with semaphore:
             try:
-                klines = await binance.fetch_klines(p["sym"], "5m", 80)
+                # Fetch all timeframes + OB in parallel for speed
+                results = await asyncio.gather(
+                    binance.fetch_klines(p["sym"], "5m", 80),
+                    binance.fetch_klines(p["sym"], "15m", 50),
+                    binance.fetch_klines(p["sym"], "1h", 60),
+                    binance.fetch_klines(p["sym"], "4h", 60),
+                    binance.fetch_klines(p["sym"], "1d", 50),
+                    binance.fetch_order_book(p["sym"], 50),
+                    return_exceptions=True,
+                )
+                klines = results[0] if not isinstance(results[0], Exception) else None
+                klines_15m = results[1] if not isinstance(results[1], Exception) else None
+                klines_1h = results[2] if not isinstance(results[2], Exception) else None
+                klines_4h = results[3] if not isinstance(results[3], Exception) else None
+                klines_1d = results[4] if not isinstance(results[4], Exception) else None
+                ob = results[5] if not isinstance(results[5], Exception) else None
+
                 if klines is None or len(klines) < 30:
                     return None
-                klines_15m = await binance.fetch_klines(p["sym"], "15m", 50)
-                klines_1h = await binance.fetch_klines(p["sym"], "1h", 50)
-                ob = await binance.fetch_order_book(p["sym"], 50)
 
                 snap = MarketSnapshot(
                     symbol=p["sym"], price=p["price"],
                     volume_24h=p["vol_24h"], change_24h=p["chg_24h"],
                     klines=klines, klines_15m=klines_15m,
-                    klines_1h=klines_1h, order_book=ob,
+                    klines_1h=klines_1h, klines_4h=klines_4h,
+                    klines_1d=klines_1d, order_book=ob,
                 )
                 sig = await score_symbol(snap, mode=cfg["mode"])
 

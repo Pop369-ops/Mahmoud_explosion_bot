@@ -42,6 +42,35 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
     if snap.klines is None or len(snap.klines) < 30:
         return sig
 
+    # ─── ICT: Multi-Timeframe Bias check (HARD GATE) ──
+    from scorer.htf_bias import compute_bias, fetch_htf_klines
+    from scorer.killzones import get_current_killzone
+
+    # Fetch & cache HTF klines if not already on snapshot
+    if snap.klines_4h is None or snap.klines_1d is None:
+        try:
+            htf_data = await fetch_htf_klines(snap.symbol)
+            snap.klines_4h = htf_data.get("4h")
+            snap.klines_1d = htf_data.get("1d")
+        except Exception as e:
+            log.warning("htf_fetch_error", err=str(e))
+            htf_data = {"1d": None, "4h": None, "1h": snap.klines_1h, "15m": snap.klines_15m}
+    else:
+        htf_data = {
+            "1d": snap.klines_1d, "4h": snap.klines_4h,
+            "1h": snap.klines_1h, "15m": snap.klines_15m,
+        }
+
+    snap.htf_bias = compute_bias(htf_data, snap.price, proposed_direction=direction)
+    snap.killzone = get_current_killzone()
+
+    # HARD REJECT if HTF bias forbids this direction
+    if snap.htf_bias.rejection_reason:
+        sig.phase = Phase.REJECTED
+        sig.rejected_reason = snap.htf_bias.rejection_reason
+        sig.warnings.append(f"🚫 {snap.htf_bias.rejection_reason}")
+        return sig
+
     detector_tasks = [
         detect_volume_delta(snap), detect_order_book(snap),
         detect_funding_divergence(snap), detect_whale_flow(snap),
@@ -81,11 +110,34 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
 
     confidence = int(weighted_sum / total_weight) if total_weight > 0 else 0
 
+    # ─── Killzone quality multiplier ──
+    if snap.killzone:
+        confidence = int(confidence * snap.killzone.quality_mult)
+        confidence = max(0, min(100, confidence))
+
+    # ─── HTF bias confluence bonus / penalty ──
+    if snap.htf_bias:
+        b = snap.htf_bias
+        if direction == "long" and b.aligned_long:
+            confidence = min(100, confidence + 8)
+        elif direction == "short" and b.aligned_short:
+            confidence = min(100, confidence + 8)
+        elif b.counter_trend_setup:
+            confidence = max(0, confidence - 5)
+
     all_signals: list[str] = []
     all_warnings: list[str] = []
     for verd in verdicts:
         all_signals.extend(verd.reasons)
         all_warnings.extend(verd.warnings)
+
+    # Inject HTF bias summary
+    if snap.htf_bias:
+        all_signals.append(f"🌐 HTF: {snap.htf_bias.summary}")
+        for w in snap.htf_bias.warnings:
+            all_warnings.append(w)
+    if snap.killzone:
+        all_signals.append(f"⏱ {snap.killzone.description_ar}")
 
     sig.confidence = confidence
     sig.sources_agreed = sources_agreed

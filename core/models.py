@@ -74,13 +74,17 @@ class MarketSnapshot:
     volume_24h: float
     change_24h: float
     timestamp: datetime = field(default_factory=now_riyadh)
-    klines: Optional[object] = None
+    klines: Optional[object] = None       # 5m base
     klines_15m: Optional[object] = None
     klines_1h: Optional[object] = None
+    klines_4h: Optional[object] = None    # NEW: ICT bias
+    klines_1d: Optional[object] = None    # NEW: ICT bias
     order_book: Optional[dict] = None
     funding_rate: Optional[float] = None
     open_interest: Optional[float] = None
     whale_flow: Optional[dict] = None
+    htf_bias: Optional[object] = None     # MultiTFBias (lazy fill)
+    killzone: Optional[object] = None     # KillzoneInfo (lazy fill)
 
 
 @dataclass
