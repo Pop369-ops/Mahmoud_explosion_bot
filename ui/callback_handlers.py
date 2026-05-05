@@ -37,6 +37,18 @@ async def handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("closed:"):
             sym = data.split(":", 1)[1]
+            # Record manual close to performance log
+            trades = state.get_trades(chat_id)
+            if sym in trades:
+                trade = trades[sym]
+                try:
+                    from data_sources.binance import binance
+                    from trading.manager import record_trade_close
+                    df = await binance.fetch_klines(sym, "5m", 5)
+                    exit_price = float(df["c"].iloc[-1]) if df is not None and len(df) > 0 else trade.entry
+                    await record_trade_close(chat_id, trade, exit_price, "manual_user")
+                except Exception as e:
+                    log.warning("manual_close_record_error", err=str(e))
             await state.remove_trade(chat_id, sym)
             await q.answer(f"✅ تم إغلاق {sym}", show_alert=True)
             await q.edit_message_reply_markup(reply_markup=None)

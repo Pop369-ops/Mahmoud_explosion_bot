@@ -125,6 +125,45 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
         elif b.counter_trend_setup:
             confidence = max(0, confidence - 5)
 
+    # ─── Sentiment & On-chain (best-effort, non-blocking) ──
+    sentiment_advisory = None
+    onchain_summary = None
+    try:
+        from risk.sentiment import analyze_sentiment
+        sent = await asyncio.wait_for(analyze_sentiment(direction), timeout=8)
+        confidence = max(0, min(100, confidence + sent.score_adjustment))
+        if sent.advisory:
+            sentiment_advisory = sent.advisory
+        for w in sent.warnings:
+            sig.warnings.append(w)
+    except (asyncio.TimeoutError, Exception) as e:
+        log.debug("sentiment_skip", err=str(e))
+
+    try:
+        from risk.onchain import analyze_onchain
+        # Extract base asset (e.g. BTCUSDT → BTC). Skip leading "1000" prefix.
+        base = snap.symbol.replace("USDT", "").replace("USDC", "")
+        if base.startswith("1000"):
+            base = base[4:]
+        onchain = await asyncio.wait_for(
+            analyze_onchain(snap.symbol, base, snap.price, snap.change_24h),
+            timeout=10,
+        )
+        if onchain.composite_score >= 60 and direction == "long":
+            confidence = min(100, confidence + 5)
+        elif onchain.composite_score <= 40 and direction == "long":
+            confidence = max(0, confidence - 5)
+        elif onchain.composite_score <= 40 and direction == "short":
+            confidence = min(100, confidence + 5)
+        elif onchain.composite_score >= 60 and direction == "short":
+            confidence = max(0, confidence - 5)
+        if onchain.summary and onchain.summary != "بيانات on-chain متعادلة":
+            onchain_summary = onchain.summary
+        for w in onchain.warnings:
+            sig.warnings.append(w)
+    except (asyncio.TimeoutError, Exception) as e:
+        log.debug("onchain_skip", err=str(e))
+
     all_signals: list[str] = []
     all_warnings: list[str] = []
     for verd in verdicts:
@@ -138,6 +177,10 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
             all_warnings.append(w)
     if snap.killzone:
         all_signals.append(f"⏱ {snap.killzone.description_ar}")
+    if sentiment_advisory:
+        all_signals.append(f"😊 {sentiment_advisory}")
+    if onchain_summary:
+        all_signals.append(f"⛓ on-chain: {onchain_summary}")
 
     sig.confidence = confidence
     sig.sources_agreed = sources_agreed

@@ -36,6 +36,14 @@ async def _post_init(app):
     await cmc.start()
     await store.start()
 
+    # Init performance tracker
+    try:
+        from risk.performance import PerformanceTracker
+        perf_tracker = PerformanceTracker(settings.db_path)
+        await perf_tracker.init()
+    except Exception as e:
+        log.warning("perf_init_error", err=str(e))
+
     # Confirm Binance connection
     try:
         pairs = await binance.fetch_top_pairs(top_n=5, min_vol_usd=1_000_000)
@@ -97,6 +105,8 @@ def main():
     from ui.handlers import (
         cmd_start, cmd_help, cmd_menu, cmd_status,
         cmd_settings, cmd_scan, cmd_test,
+        cmd_capital, cmd_risk, cmd_perf, cmd_pause, cmd_resume,
+        cmd_backtest, cmd_sentiment,
     )
     from ui.callback_handlers import handle_callback
 
@@ -116,6 +126,15 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("test", cmd_test))
+    # Risk management
+    app.add_handler(CommandHandler("capital", cmd_capital))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("perf", cmd_perf))
+    app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    # Advanced analytics
+    app.add_handler(CommandHandler("backtest", cmd_backtest))
+    app.add_handler(CommandHandler("sentiment", cmd_sentiment))
 
     # Callbacks (inline buttons)
     app.add_handler(CallbackQueryHandler(handle_callback))

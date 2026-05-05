@@ -13,7 +13,55 @@ async def open_trade_from_signal(chat_id: int, signal: Signal) -> Trade:
         peak_price=signal.entry,
     )
     await state.add_trade(trade)
+    # Record opening with risk manager
+    try:
+        from risk.daily_limits import risk_manager
+        risk_manager.record_trade_opened(chat_id)
+    except Exception:
+        pass
     return trade
+
+
+async def record_trade_close(chat_id: int, trade: Trade,
+                                exit_price: float, close_reason: str):
+    """Persist closed trade to performance log + update risk state."""
+    pnl_pct = (exit_price - trade.entry) / trade.entry * 100 if trade.entry > 0 else 0
+    sl_dist = abs(trade.entry - trade.sl)
+    pnl_r = (exit_price - trade.entry) / sl_dist if sl_dist > 0 else 0
+
+    # Duration
+    duration = int((now_riyadh() - trade.opened_at).total_seconds() / 60)
+
+    # Update risk manager
+    try:
+        from risk.daily_limits import risk_manager
+        risk_manager.record_trade_result(chat_id, pnl_pct)
+    except Exception:
+        pass
+
+    # Persist to performance log
+    try:
+        from risk.performance import PerformanceTracker, TradeRecord
+        from config.settings import settings
+        tracker = PerformanceTracker(settings.db_path)
+        await tracker.init()
+        rec = TradeRecord(
+            chat_id=chat_id, symbol=trade.symbol,
+            direction="long",  # bot is long-only for now
+            setup_type=getattr(trade, "setup_type", "unknown"),
+            entry=trade.entry, sl=trade.sl, tp1=trade.tp1,
+            exit_price=exit_price,
+            pnl_pct=round(pnl_pct, 2),
+            pnl_r=round(pnl_r, 2),
+            confidence=trade.confidence,
+            sources_agreed=getattr(trade, "sources_agreed", 0),
+            duration_minutes=duration,
+            closed_at=now_riyadh(),
+            close_reason=close_reason,
+        )
+        await tracker.record(rec)
+    except Exception:
+        pass
 
 
 async def analyze_exit(trade: Trade) -> dict:

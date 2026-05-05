@@ -1,8 +1,10 @@
 """Telegram message builders. Ported from v3 with multi-source transparency."""
 from core.models import Signal, Trade, PHASE_LABELS, PHASE_ICONS, now_riyadh_str, fmt
+from risk.position_sizing import calculate_position_size, suggest_leverage
+from risk.daily_limits import risk_manager
 
 
-def build_entry_alert(sig: Signal, rank: int = 1) -> str:
+def build_entry_alert(sig: Signal, rank: int = 1, chat_id: int = 0) -> str:
     icon = PHASE_ICONS.get(sig.phase, "⚡")
     phase_txt = PHASE_LABELS.get(sig.phase, sig.phase.value)
     bar_full = int(sig.confidence / 10)
@@ -54,6 +56,38 @@ def build_entry_alert(sig: Signal, rank: int = 1) -> str:
     m += f"💰 *TP1:* `${fmt(sig.tp1)}` _({tp1_pct:+.2f}%)_\n"
     m += f"💰 *TP2:* `${fmt(sig.tp2)}` _({tp2_pct:+.2f}%)_\n"
     m += f"🏆 *TP3:* `${fmt(sig.tp3)}` _({tp3_pct:+.2f}%)_\n\n"
+
+    # ─── Position sizing block ──
+    if chat_id:
+        try:
+            risk_state = risk_manager.get(chat_id)
+            if risk_state.capital > 0:
+                from core.state import state as user_state
+                cfg = user_state.get_user_cfg(chat_id)
+                risk_pct = cfg.get("risk_pct", 1.0)
+                direction = "long"  # alerts module is long-only for now
+                pos = calculate_position_size(
+                    capital=risk_state.capital,
+                    entry_price=sig.entry,
+                    sl_price=sig.sl,
+                    direction=direction,
+                    risk_pct=risk_pct,
+                    leverage=1.0,
+                )
+                suggested_lev = suggest_leverage(pos.sl_distance_pct)
+                m += "💼 *إدارة المركز:*\n"
+                m += f"  💰 رأس مالك: `${pos.capital:,.0f}`\n"
+                m += f"  ⚠️ معرض للخسارة: `${pos.risk_usd:.2f}` ({pos.risk_pct}%)\n"
+                m += f"  📦 حجم المركز (1x): `${pos.position_size_usd:,.2f}`\n"
+                m += f"  🔢 عدد الوحدات: `{pos.position_size_units:g}`\n"
+                m += f"  🎚 رافعة مقترحة: `حتى {suggested_lev}x`\n"
+                if pos.warnings:
+                    for w in pos.warnings[:2]:
+                        m += f"  {w}\n"
+                m += "\n"
+        except Exception:
+            pass
+
     m += f"🎮 _الوضع: {sig.mode.value}_ | ⚠️ _للأغراض التعليمية فقط_"
     return m
 

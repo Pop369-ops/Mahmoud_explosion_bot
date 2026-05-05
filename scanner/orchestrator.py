@@ -147,8 +147,26 @@ async def run_scan_for_user(chat_id: int, bot: Bot, send_alerts: bool = True) ->
 
 async def _dispatch_alert(chat_id: int, sig: Signal, snap: MarketSnapshot, bot: Bot):
     """Send alert message + cache pending signal for button callbacks."""
+    # ─── Risk gate: don't bother user if they're paused/limited ──
+    from risk.daily_limits import risk_manager
+    risk_check = risk_manager.can_take_trade(chat_id)
+    if not risk_check.allowed:
+        # Send only ONE consolidated message per cooldown period (caller throttles via state.in_cooldown)
+        if risk_check.reason and "لم تحدد رأس المال" not in risk_check.reason:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🚫 *إشارة جيدة لـ {sig.symbol} لكن:*\n\n{risk_check.reason}",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        log.info("alert_blocked_by_risk", chat=chat_id, symbol=sig.symbol,
+                 reason=risk_check.reason)
+        return
+
     cfg = state.get_user_cfg(chat_id)
-    msg = build_entry_alert(sig)
+    msg = build_entry_alert(sig, chat_id=chat_id)
     kb = signal_keyboard(sig.symbol, ai_enabled=cfg.get("ai_enabled", False))
 
     pending = {
@@ -228,6 +246,17 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown", reply_markup=kb,
                     )
                     if ex["action"] in ("exit_now", "exit_sl"):
+                        # Record to performance log before removing
+                        try:
+                            from trading.manager import record_trade_close
+                            close_reason = "SL" if ex["action"] == "exit_sl" else "TP/manual"
+                            await record_trade_close(
+                                chat_id, trade,
+                                ex.get("price", 0),
+                                close_reason,
+                            )
+                        except Exception as e:
+                            log.warning("record_close_error", err=str(e))
                         await state.remove_trade(chat_id, sym)
             except Exception as e:
                 log.warning("monitor_error", sym=sym, err=str(e))
