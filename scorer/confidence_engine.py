@@ -149,7 +149,100 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
     sig.phase = _classify_phase(confidence, sources_agreed, verdicts)
     _attach_tp_sl(sig, snap, mode, direction)
     _attach_quick_metrics(sig, snap)
+
+    # ═══════════════════════════════════════════════════════
+    # HARD QUALITY GATE — final filter before signal goes live
+    # ═══════════════════════════════════════════════════════
+    _apply_hard_gate(sig, snap, direction)
+
     return sig
+
+
+def _apply_hard_gate(sig: Signal, snap: MarketSnapshot, direction: str):
+    """Apply strict quality filters. Rejects signals that pass scoring
+    but have hidden quality issues that lead to losses.
+
+    Rejection criteria (any one triggers rejection):
+    1. SL is on ATR fallback AND R:R on TP1 < 1.5 (high stop-hunt risk)
+    2. Sources agreed < 5 AND price is in HTF premium/discount opposite to trade
+    3. Order Book reading is opposite (score < 40) AND not strongly mitigated
+    4. R:R on TP1 < 0.8 (reward not worth the risk)
+    5. SL is on ATR fallback AND HTF score is weak (< 20 absolute)
+    """
+    if sig.phase == Phase.REJECTED:
+        return  # already rejected upstream
+    if sig.phase == Phase.NONE:
+        return  # not actionable anyway
+
+    rejections = []
+    sl_logic = ""
+    rr_tp1 = 0.0
+
+    # Extract SL logic and R:R from the signal text we already injected
+    for s in sig.signals:
+        if s.startswith("🛡 SL:"):
+            sl_logic = s
+        if "R:R =" in s:
+            try:
+                # Parse "⚖️ R:R = 1.85 / 3.20 / 5.10"
+                parts = s.split("=")[1].split("/")
+                rr_tp1 = float(parts[0].strip())
+            except (IndexError, ValueError):
+                pass
+
+    is_atr_fallback = "ATR fallback" in sl_logic or "ATR fallback" in sig.signals.__str__()
+
+    # ─── Gate 1: ATR fallback + weak R:R ─────────────────
+    if is_atr_fallback and rr_tp1 > 0 and rr_tp1 < 1.5:
+        rejections.append(
+            f"SL على ATR + R:R ضعيف ({rr_tp1:.2f} < 1.5) — "
+            f"احتمال stop hunt مرتفع جداً"
+        )
+
+    # ─── Gate 2: very weak R:R (regardless of SL method) ─
+    if rr_tp1 > 0 and rr_tp1 < 0.8:
+        rejections.append(
+            f"R:R على TP1 ضعيف جداً ({rr_tp1:.2f}) — "
+            f"المكافأة أقل من المخاطرة"
+        )
+
+    # ─── Gate 3: order book contradicts the trade ────────
+    ob_verdict = next((v for v in sig.verdicts if v.name == "order_book"), None)
+    if ob_verdict and ob_verdict.score < 35 and ob_verdict.confidence >= 0.5:
+        if sig.sources_agreed < 5:
+            rejections.append(
+                f"دفتر الأوامر يعارض الصفقة ({ob_verdict.score}/100) "
+                f"+ المصادر المتفقة قليلة ({sig.sources_agreed}/{sig.sources_total})"
+            )
+
+    # ─── Gate 4: premium/discount conflict on HTF ────────
+    if snap.htf_bias and snap.htf_bias.daily:
+        zone = snap.htf_bias.daily.zone
+        if direction == "long" and zone == "premium" and sig.sources_agreed < 5:
+            rejections.append(
+                "شراء في منطقة premium على اليومي مع مصادر < 5 — مكلف وغير محقق"
+            )
+        elif direction == "short" and zone == "discount" and sig.sources_agreed < 5:
+            rejections.append(
+                "بيع في منطقة discount على اليومي مع مصادر < 5 — متأخر"
+            )
+
+    # ─── Gate 5: ATR fallback + weak HTF alignment ───────
+    if is_atr_fallback and snap.htf_bias:
+        htf_score = abs(snap.htf_bias.bullish_score)
+        if htf_score < 20:
+            rejections.append(
+                f"SL على ATR + اتجاه عام ضعيف (HTF score: {snap.htf_bias.bullish_score}) — "
+                f"لا يوجد دعم اتجاهي قوي"
+            )
+
+    # ─── Apply rejection ─────────────────────────────────
+    if rejections:
+        sig.phase = Phase.REJECTED
+        sig.rejected_reason = " | ".join(rejections[:2])  # show top 2 reasons
+        sig.warnings.append(f"🚫 رُفضت: {rejections[0]}")
+        log.info("hard_gate_reject", symbol=sig.symbol,
+                 confidence=sig.confidence, reasons=rejections)
 
 
 def _classify_phase(confidence: int, sources_agreed: int,
