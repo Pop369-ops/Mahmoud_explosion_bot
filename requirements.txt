@@ -1,0 +1,12 @@
+python-telegram-bot[job-queue]==20.7
+APScheduler==3.10.4
+aiohttp==3.9.5
+websockets==12.0
+pandas==2.2.2
+numpy==1.26.4
+pydantic==2.7.1
+pydantic-settings==2.2.1
+structlog==24.1.0
+aiosqlite==0.20.0
+anthropic==0.34.2
+google-generativeai==0.7.2
