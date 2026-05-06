@@ -141,13 +141,20 @@ def _retroactive_scan_one_pass(df: pd.DataFrame, symbol: str,
         if hdf is None:
             htf_trimmed[tf] = None
             continue
-        # Keep only candles before our test candle
-        cutoff_ms = int(df["t"].iloc[idx])
-        trimmed = hdf[hdf["t"] <= cutoff_ms].tail(60)
-        htf_trimmed[tf] = trimmed if len(trimmed) >= 10 else None
+        try:
+            cutoff_ms = int(df["t"].iloc[idx])
+            trimmed = hdf[hdf["t"] <= cutoff_ms].tail(60)
+            htf_trimmed[tf] = trimmed if len(trimmed) >= 10 else None
+        except Exception:
+            htf_trimmed[tf] = None
 
-    bias = compute_bias(htf_trimmed, current_price, "long")
-    htf_aligned = bias.aligned_long
+    try:
+        bias = compute_bias(htf_trimmed, current_price, "long")
+        htf_aligned = bias.aligned_long
+    except Exception as e:
+        log.debug("retro_bias_error", err=str(e))
+        bias = None
+        htf_aligned = False
 
     # Compute change_24h at that historical moment
     bars_24h = min(288, idx)  # 288 5m bars = 24h
@@ -178,10 +185,10 @@ def _retroactive_scan_one_pass(df: pd.DataFrame, symbol: str,
     if no_liquidity and abs(chg_24h) >= 5.0:
         rejection_reasons.append(f"لا سيولة + حركة {chg_24h:+.1f}%")
 
-    if bias.daily and bias.daily.zone == "premium" and sources_strong < 4:
+    if bias and bias.daily and bias.daily.zone == "premium" and sources_strong < 4:
         rejection_reasons.append("شراء في premium zone")
 
-    if bias.rejection_reason:
+    if bias and bias.rejection_reason:
         rejection_reasons.append(f"HTF: {bias.rejection_reason[:50]}")
 
     if confidence < 60:
@@ -242,11 +249,16 @@ async def scan_symbol_history(symbol: str, hours_back: int = 4) -> list[Historic
 async def scan_market_history(top_n: int = 50, hours_back: int = 4,
                                 min_confidence: int = 65) -> dict:
     """Scan top N symbols for missed signals in past hours."""
-    pairs = await binance.fetch_top_pairs(top_n=top_n, min_vol_usd=10_000_000)
-    if not pairs:
-        return {"error": "no_pairs"}
+    try:
+        pairs = await binance.fetch_top_pairs(top_n=top_n, min_vol_usd=10_000_000)
+    except Exception as e:
+        log.warning("retro_pairs_error", err=str(e))
+        return {"error": f"خطأ في جلب قائمة العملات: {type(e).__name__}"}
 
-    semaphore = asyncio.Semaphore(8)
+    if not pairs:
+        return {"error": "لم يتم العثور على عملات تتوفر شروط الحجم"}
+
+    semaphore = asyncio.Semaphore(5)  # reduced from 8 for stability
 
     async def _scan(p):
         async with semaphore:
@@ -256,21 +268,38 @@ async def scan_market_history(top_n: int = 50, hours_back: int = 4,
                 log.warning("retro_scan_error", sym=p["sym"], err=str(e))
                 return p["sym"], []
 
-    results = await asyncio.gather(*[_scan(p) for p in pairs])
+    try:
+        results = await asyncio.gather(
+            *[_scan(p) for p in pairs],
+            return_exceptions=True,
+        )
+    except Exception as e:
+        log.warning("retro_gather_error", err=str(e))
+        return {"error": f"خطأ في المسح المتوازي: {type(e).__name__}"}
+
+    # Filter out exceptions
+    valid_results = [r for r in results if isinstance(r, tuple)]
 
     # Aggregate
-    accepted_signals = []   # would have triggered alerts
-    near_misses = []         # high confidence but rejected by HARD GATE
-    rejection_buckets = {}   # count of each rejection reason
+    accepted_signals = []
+    near_misses = []
+    rejection_buckets = {}
+    symbols_with_data = 0
+    symbols_with_error = 0
 
-    for sym, sigs in results:
+    for item in valid_results:
+        if not isinstance(item, tuple):
+            symbols_with_error += 1
+            continue
+        sym, sigs = item
+        if sigs:
+            symbols_with_data += 1
         for s in sigs:
             if s.accepted:
                 accepted_signals.append(s)
             elif s.confidence >= min_confidence:
                 near_misses.append(s)
                 for r in s.rejection_reasons:
-                    # Group similar reasons
                     key = r.split("(")[0].strip()
                     rejection_buckets[key] = rejection_buckets.get(key, 0) + 1
 
@@ -279,22 +308,27 @@ async def scan_market_history(top_n: int = 50, hours_back: int = 4,
 
     return {
         "scanned_symbols": len(pairs),
+        "symbols_with_data": symbols_with_data,
+        "symbols_with_error": symbols_with_error,
         "hours_back": hours_back,
         "accepted_count": len(accepted_signals),
         "near_miss_count": len(near_misses),
-        "accepted": accepted_signals[:10],   # top 10
-        "near_misses": near_misses[:10],     # top 10
+        "accepted": accepted_signals[:10],
+        "near_misses": near_misses[:10],
         "rejection_summary": rejection_buckets,
     }
 
 
 def render_history_report(report: dict) -> str:
     if "error" in report:
-        return "❌ لا يمكن جلب البيانات"
+        return f"❌ {report['error']}\n\nحاول مرة أخرى بعد دقيقة."
 
     m = f"🔍 فحص آخر {report['hours_back']} ساعات\n"
     m += "━━━━━━━━━━━━━━━━━━━━\n"
-    m += f"عدد العملات المفحوصة: {report['scanned_symbols']}\n\n"
+    m += f"عدد العملات المفحوصة: {report['scanned_symbols']}\n"
+    if report.get('symbols_with_data', 0) > 0:
+        m += f"العملات بإشارات محتملة: {report['symbols_with_data']}\n"
+    m += "\n"
 
     accepted = report["accepted"]
     near_misses = report["near_misses"]
