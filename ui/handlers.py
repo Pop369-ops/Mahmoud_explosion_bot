@@ -413,6 +413,74 @@ async def cmd_backtest(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ خطأ: {type(e).__name__}: {e}")
 
 
+async def cmd_exhaust(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Check exhaustion patterns on a symbol. /exhaust BTCUSDT"""
+    from scorer.exhaustion import analyze_exhaustion, render_exhaustion_alert
+    from data_sources.binance import binance
+    parts = u.message.text.split()
+    if len(parts) < 2:
+        await u.message.reply_text(
+            "استخدام: `/exhaust BTC` أو `/exhaust BTCUSDT`",
+            parse_mode="Markdown",
+        )
+        return
+    sym = parts[1].upper().replace("/", "")
+    if not sym.endswith("USDT") and not sym.endswith("USDC"):
+        sym += "USDT"
+    msg = await u.message.reply_text(f"🔍 جاري فحص {sym}...")
+    try:
+        df = await binance.fetch_klines(sym, "5m", 100)
+        if df is None or len(df) < 30:
+            await msg.edit_text(f"❌ لا توجد بيانات كافية لـ {sym}")
+            return
+        funding = None
+        try:
+            fr = await binance.fetch_funding_rate(sym)
+            if fr:
+                funding = fr.get("funding_rate")
+        except Exception:
+            pass
+        snap = analyze_exhaustion(df, funding)
+        current = float(df["c"].iloc[-1])
+
+        if snap.direction == "neutral":
+            await msg.edit_text(
+                f"✓ *{sym}* — لا توجد إشارات إرهاق واضحة\n"
+                f"السوق متوازن في كلا الاتجاهين.",
+                parse_mode="Markdown",
+            )
+        else:
+            alert = render_exhaustion_alert(snap, sym, current)
+            await msg.edit_text(alert, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ خطأ: {type(e).__name__}: {str(e)[:150]}")
+
+
+async def cmd_diagnose(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Diagnose why live scanner produces no signals. /diagnose [top_n]"""
+    from scanner.diagnostic import diagnose_live_scan, render_diagnosis
+    parts = u.message.text.split()
+    top_n = 20
+    if len(parts) > 1:
+        try:
+            top_n = max(10, min(50, int(parts[1])))
+        except ValueError:
+            pass
+    msg = await u.message.reply_text(
+        f"🔬 جاري تشخيص المسح الحي على top {top_n} عملة...\n"
+        f"يستخدم نفس المنطق الكامل للمسح (ICT + HARD GATE + sentiment + onchain)\n"
+        f"قد يأخذ 90-150 ثانية"
+    )
+    try:
+        report = await diagnose_live_scan(top_n=top_n)
+        text = render_diagnosis(report)
+        await msg.edit_text(text)
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ خطأ: {type(e).__name__}\n{str(e)[:200]}"
+        )
+
+
 async def cmd_scan_history(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Retroactively scan past N hours. /scan_history [hours] [top_n]"""
     from scanner.retroactive import scan_market_history, render_history_report

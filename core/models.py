@@ -115,6 +115,8 @@ class Signal:
     signals: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     rejected_reason: Optional[str] = None
+    direction: str = "long"   # "long" or "short"
+    exhaustion_summary: Optional[str] = None
 
     @property
     def quality_label(self) -> str:
@@ -136,6 +138,7 @@ class Trade:
     confidence: int
     phase: Phase
     mode: Mode
+    direction: str = "long"
     opened_at: datetime = field(default_factory=now_riyadh)
     peak_price: float = 0.0
     tp1_hit: bool = False

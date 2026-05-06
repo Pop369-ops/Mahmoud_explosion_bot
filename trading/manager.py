@@ -10,6 +10,7 @@ async def open_trade_from_signal(chat_id: int, signal: Signal) -> Trade:
         entry=signal.entry, sl=signal.sl,
         tp1=signal.tp1, tp2=signal.tp2, tp3=signal.tp3,
         confidence=signal.confidence, phase=signal.phase, mode=signal.mode,
+        direction=getattr(signal, 'direction', 'long'),
         peak_price=signal.entry,
     )
     await state.add_trade(trade)

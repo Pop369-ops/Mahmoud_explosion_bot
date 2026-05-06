@@ -23,6 +23,95 @@ from filters.risk_gate import filter_liquidity, critical_risk_check
 log = get_logger(__name__)
 
 
+async def score_symbol_auto(snap: MarketSnapshot, mode: Mode = Mode.DAY) -> Signal:
+    """Try both long AND short, return the stronger signal.
+
+    Strategy:
+    - First check HTF bias to determine the natural direction
+    - If aligned strongly, only run that direction
+    - If unclear, run both and pick the highest confidence (above threshold)
+    - Add exhaustion-based contrarian signals if appropriate
+    """
+    from scorer.htf_bias import compute_bias, fetch_htf_klines
+    from scorer.exhaustion import analyze_exhaustion
+
+    # ─── Step 1: Determine direction preference from HTF bias ────
+    if snap.klines_4h is None or snap.klines_1d is None:
+        try:
+            htf_data = await fetch_htf_klines(snap.symbol)
+            snap.klines_4h = htf_data.get("4h")
+            snap.klines_1d = htf_data.get("1d")
+            snap.klines_1h = snap.klines_1h or htf_data.get("1h")
+            snap.klines_15m = snap.klines_15m or htf_data.get("15m")
+        except Exception as e:
+            log.warning("auto_htf_fetch_error", err=str(e))
+
+    htf_data_local = {
+        "1d": snap.klines_1d, "4h": snap.klines_4h,
+        "1h": snap.klines_1h, "15m": snap.klines_15m,
+    }
+
+    bias_long = compute_bias(htf_data_local, snap.price, "long")
+    bias_short = compute_bias(htf_data_local, snap.price, "short")
+
+    # ─── Step 2: Exhaustion check (could flip direction) ────
+    funding = snap.funding_rate
+    exhaustion = analyze_exhaustion(
+        df_5m=snap.klines, funding_rate=funding,
+        change_24h=snap.change_24h,
+    )
+
+    # ─── Step 3: Decide which directions to evaluate ────
+    # Priority logic:
+    #   - If aligned long AND no buying exhaustion → run long only
+    #   - If aligned short AND no selling exhaustion → run short only
+    #   - If aligned long BUT buying exhaustion strong → also run short (potential reversal)
+    #   - If aligned short BUT selling exhaustion strong → also run long
+    #   - If no alignment → run both, pick best
+
+    run_long = True
+    run_short = True
+
+    if bias_long.aligned_long and exhaustion.direction != "buying_exhaustion":
+        run_short = False  # don't bother
+    elif bias_short.aligned_short and exhaustion.direction != "selling_exhaustion":
+        run_long = False
+    # Otherwise run both
+
+    sig_long = None
+    sig_short = None
+
+    if run_long:
+        sig_long = await score_symbol(snap, mode, "long")
+    if run_short:
+        # Reset HTF on snap so short scoring re-fetches
+        sig_short = await score_symbol(snap, mode, "short")
+
+    # ─── Step 4: Choose the best signal ────
+    candidates = []
+    if sig_long and sig_long.phase != Phase.REJECTED and sig_long.phase != Phase.NONE:
+        candidates.append(sig_long)
+    if sig_short and sig_short.phase != Phase.REJECTED and sig_short.phase != Phase.NONE:
+        candidates.append(sig_short)
+
+    if not candidates:
+        # Both rejected/none. Return the long one by default (with rejection details)
+        return sig_long if sig_long else sig_short
+
+    # Sort by confidence × sources_agreed
+    candidates.sort(key=lambda s: -(s.confidence * (1 + s.sources_agreed * 0.1)))
+    best = candidates[0]
+
+    # Attach exhaustion info to the signal
+    best.exhaustion_summary = exhaustion.summary_ar if exhaustion.direction != "neutral" else None
+    if exhaustion.direction != "neutral":
+        for w in exhaustion.signals_detected:
+            if w not in best.warnings:
+                best.warnings.append(f"⚡ {w}")
+
+    return best
+
+
 async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
                         direction: str = "long") -> Signal:
     sig = Signal(
@@ -30,6 +119,7 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
         sources_agreed=0, sources_total=0,
         price=snap.price, change_24h=snap.change_24h, volume_24h=snap.volume_24h,
         entry=0, sl=0, tp1=0, tp2=0, tp3=0, sl_pct=0, atr=0, mode=mode,
+        direction=direction,
     )
 
     risk = await critical_risk_check(direction)
@@ -71,11 +161,28 @@ async def score_symbol(snap: MarketSnapshot, mode: Mode = Mode.DAY,
         sig.warnings.append(f"🚫 {snap.htf_bias.rejection_reason}")
         return sig
 
-    detector_tasks = [
-        detect_volume_delta(snap), detect_order_book(snap),
-        detect_funding_divergence(snap), detect_whale_flow(snap),
-        detect_squeeze_breakout(snap), detect_pre_explosion(snap),
-    ]
+    # ─── Direction-aware detector selection ──
+    if direction == "short":
+        from detectors.short_signals import (
+            detect_short_volume_delta, detect_short_order_book,
+            detect_short_funding_squeeze, detect_short_whale_distribution,
+            detect_short_squeeze_breakdown, detect_short_distribution,
+        )
+        detector_tasks = [
+            detect_short_volume_delta(snap),
+            detect_short_order_book(snap),
+            detect_short_funding_squeeze(snap),
+            detect_short_whale_distribution(snap),
+            detect_short_squeeze_breakdown(snap),
+            detect_short_distribution(snap),
+        ]
+    else:
+        detector_tasks = [
+            detect_volume_delta(snap), detect_order_book(snap),
+            detect_funding_divergence(snap), detect_whale_flow(snap),
+            detect_squeeze_breakout(snap), detect_pre_explosion(snap),
+        ]
+
     filter_tasks = [
         filter_multi_timeframe(snap, direction),
         filter_btc_trend(snap, direction),

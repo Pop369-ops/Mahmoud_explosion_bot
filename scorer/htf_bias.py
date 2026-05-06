@@ -100,32 +100,45 @@ def compute_bias(htf_data: dict, current_price: float,
             weight_sum += w
     bias.bullish_score = int(score_sum / weight_sum) if weight_sum > 0 else 0
 
-    # ─── Alignment check ────────────────────────────────
-    daily_ok_long = bias.daily is None or bias.daily.trend in ("bullish", "ranging")
-    h4_ok_long = bias.h4 is None or bias.h4.trend in ("bullish", "ranging")
-    daily_ok_short = bias.daily is None or bias.daily.trend in ("bearish", "ranging")
-    h4_ok_short = bias.h4 is None or bias.h4.trend in ("bearish", "ranging")
+    # ─── Alignment check (STRICT) ──────────────────────
+    # 'ranging' is no longer auto-pass; require true bullish/bearish alignment
+    daily_bullish = bias.daily is not None and bias.daily.trend == "bullish"
+    daily_bearish = bias.daily is not None and bias.daily.trend == "bearish"
+    daily_ranging = bias.daily is not None and bias.daily.trend == "ranging"
+    h4_bullish = bias.h4 is not None and bias.h4.trend == "bullish"
+    h4_bearish = bias.h4 is not None and bias.h4.trend == "bearish"
 
-    bias.aligned_long = daily_ok_long and h4_ok_long and bias.bullish_score > -10
-    bias.aligned_short = daily_ok_short and h4_ok_short and bias.bullish_score < 10
+    # True alignment: both daily and 4h agree with direction
+    # OR daily ranging + 4h strongly aligned + score supports
+    bias.aligned_long = (
+        (daily_bullish and (h4_bullish or h4_bearish is False))
+        or (daily_ranging and h4_bullish and bias.bullish_score >= 20)
+        or (bias.daily is None and h4_bullish)
+    )
+    bias.aligned_short = (
+        (daily_bearish and (h4_bearish or h4_bullish is False))
+        or (daily_ranging and h4_bearish and bias.bullish_score <= -20)
+        or (bias.daily is None and h4_bearish)
+    )
 
-    # ─── Counter-trend (CHoCH on 1H against HTF) ────────
+    # ─── Counter-trend setup (CHoCH on 1H against HTF) ─
+    bias.counter_trend_setup = False
     if bias.h1 and bias.h1.last_event == "CHoCH_bullish" and not bias.aligned_long:
         bias.counter_trend_setup = True
     if bias.h1 and bias.h1.last_event == "CHoCH_bearish" and not bias.aligned_short:
         bias.counter_trend_setup = True
 
-    # ─── Rejection logic ────────────────────────────────
+    # ─── Contrarian warnings (do NOT reject — show with warning) ────
+    # The user wants signals against trend with strong warnings
     if proposed_direction == "long":
-        if bias.daily and bias.daily.trend == "bearish" and bias.bullish_score < -30:
-            if not (bias.h1 and bias.h1.last_event == "CHoCH_bullish"):
-                bias.rejection_reason = (
-                    f"اتجاه يومي هابط (score: {bias.bullish_score}) — "
-                    f"الشراء يخالف الاتجاه الكبير"
-                )
-        elif bias.h4 and bias.h4.trend == "bearish" and bias.h4.bullish_score < -40:
+        if daily_bearish:
             bias.warnings.append(
-                f"⚠️ اتجاه 4H هابط — صفقة شراء contrarian (احذر)"
+                f"🚨 *تحذير قوي:* الاتجاه اليومي هابط (score {bias.bullish_score})\n"
+                f"   الشراء contrarian — تأكد من sweep قاع + CHoCH على 1H أولاً"
+            )
+        if h4_bearish:
+            bias.warnings.append(
+                f"⚠️ اتجاه 4H هابط — صفقة شراء عكس الموجة"
             )
         if bias.daily and bias.daily.is_premium and bias.bullish_score < 30:
             bias.warnings.append(
@@ -133,16 +146,19 @@ def compute_bias(htf_data: dict, current_price: float,
             )
 
     elif proposed_direction == "short":
-        if bias.daily and bias.daily.trend == "bullish" and bias.bullish_score > 30:
-            if not (bias.h1 and bias.h1.last_event == "CHoCH_bearish"):
-                bias.rejection_reason = (
-                    f"اتجاه يومي صاعد (score: {bias.bullish_score}) — "
-                    f"البيع يخالف الاتجاه الكبير"
-                )
-        elif bias.h4 and bias.h4.trend == "bullish" and bias.h4.bullish_score > 40:
-            bias.warnings.append("⚠️ اتجاه 4H صاعد — صفقة بيع contrarian")
+        if daily_bullish:
+            bias.warnings.append(
+                f"🚨 *تحذير قوي:* الاتجاه اليومي صاعد (score {bias.bullish_score})\n"
+                f"   البيع contrarian — تأكد من sweep قمة + CHoCH على 1H أولاً"
+            )
+        if h4_bullish:
+            bias.warnings.append(
+                f"⚠️ اتجاه 4H صاعد — صفقة بيع عكس الموجة"
+            )
         if bias.daily and bias.daily.is_discount and bias.bullish_score > -30:
-            bias.warnings.append("⚠️ السعر في منطقة discount على اليومي — بيع متأخر")
+            bias.warnings.append(
+                "⚠️ السعر في منطقة discount على اليومي — بيع متأخر"
+            )
 
     # ─── Summary ────────────────────────────────────────
     if bias.aligned_long:

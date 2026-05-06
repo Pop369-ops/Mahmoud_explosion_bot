@@ -10,7 +10,14 @@ def build_entry_alert(sig: Signal, rank: int = 1, chat_id: int = 0) -> str:
     bar_full = int(sig.confidence / 10)
     bar = "█" * bar_full + "░" * (10 - bar_full)
 
-    m = f"{icon} *{phase_txt}*\n"
+    # Direction badge (LONG = bullish, SHORT = bearish)
+    direction = getattr(sig, 'direction', 'long')
+    if direction == "short":
+        dir_badge = "🐻 *SHORT* (انفجار بيع)"
+    else:
+        dir_badge = "🐂 *LONG* (انفجار شراء)"
+
+    m = f"{icon} *{phase_txt}* | {dir_badge}\n"
     m += f"🪙 *{sig.symbol}* | 🕐 {now_riyadh_str()}\n"
     m += "━━━━━━━━━━━━━━━━━━━━\n\n"
     m += f"💰 السعر: `${fmt(sig.price)}`\n"
@@ -38,15 +45,23 @@ def build_entry_alert(sig: Signal, rank: int = 1, chat_id: int = 0) -> str:
             m += f"  {s}\n"
         m += "\n"
 
+    # Exhaustion summary if present
+    if getattr(sig, 'exhaustion_summary', None):
+        m += f"⚡ *إرهاق ملحوظ:*\n  {sig.exhaustion_summary}\n\n"
+
     if sig.warnings:
         m += "⚠️ *تحذيرات:*\n"
-        for w in sig.warnings[:4]:
+        for w in sig.warnings[:5]:
             m += f"  {w}\n"
         m += "\n"
 
     m += "━━━━━━━━━━━━━━━━━━━━\n"
-    m += f"🟢 *دخول:* `${fmt(sig.entry)}`\n"
-    m += f"🔴 *SL:* `${fmt(sig.sl)}` _(-{sig.sl_pct:.1f}%)_\n"
+    sl_label = "🔴 *SL:*" if direction == "long" else "🔴 *SL:*"
+    sl_sign = "-" if direction == "long" else "+"
+    entry_emoji = "🟢" if direction == "long" else "🔴"
+    entry_word = "دخول شراء" if direction == "long" else "دخول بيع"
+    m += f"{entry_emoji} *{entry_word}:* `${fmt(sig.entry)}`\n"
+    m += f"🔴 *SL:* `${fmt(sig.sl)}` _({sl_sign}{sig.sl_pct:.1f}%)_\n"
 
     # Compute actual TP percentages
     tp1_pct = (sig.tp1 - sig.entry) / sig.entry * 100 if sig.entry > 0 else 0
@@ -72,12 +87,11 @@ def build_entry_alert(sig: Signal, rank: int = 1, chat_id: int = 0) -> str:
                 from core.state import state as user_state
                 cfg = user_state.get_user_cfg(chat_id)
                 risk_pct = cfg.get("risk_pct", 1.0)
-                direction = "long"  # alerts module is long-only for now
                 pos = calculate_position_size(
                     capital=risk_state.capital,
                     entry_price=sig.entry,
                     sl_price=sig.sl,
-                    direction=direction,
+                    direction=direction,  # use actual signal direction
                     risk_pct=risk_pct,
                     leverage=1.0,
                 )

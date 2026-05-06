@@ -14,7 +14,7 @@ from core.models import MarketSnapshot, Signal, Phase, Mode
 from core.state import state
 from core.logger import get_logger
 from data_sources.binance import binance
-from scorer.confidence_engine import score_symbol
+from scorer.confidence_engine import score_symbol, score_symbol_auto
 from trading.manager import analyze_exit
 from ui.alerts import build_entry_alert, build_exit_alert
 from ui.keyboards import signal_keyboard, exit_keyboard
@@ -62,7 +62,7 @@ async def scan_single_symbol(chat_id: int, symbol: str, bot: Bot,
         )
 
         cfg = state.get_user_cfg(chat_id)
-        sig = await score_symbol(snap, mode=cfg["mode"])
+        sig = await score_symbol_auto(snap, mode=cfg["mode"])
 
         if send_alert and sig.phase != Phase.NONE and sig.phase != Phase.REJECTED:
             await _dispatch_alert(chat_id, sig, snap, bot)
@@ -119,7 +119,7 @@ async def run_scan_for_user(chat_id: int, bot: Bot, send_alerts: bool = True) ->
                     klines_1h=klines_1h, klines_4h=klines_4h,
                     klines_1d=klines_1d, order_book=ob,
                 )
-                sig = await score_symbol(snap, mode=cfg["mode"])
+                sig = await score_symbol_auto(snap, mode=cfg["mode"])
 
                 if (sig.phase != Phase.NONE
                     and sig.phase != Phase.REJECTED
@@ -180,6 +180,7 @@ async def _dispatch_alert(chat_id: int, sig: Signal, snap: MarketSnapshot, bot: 
         "price": sig.price, "change_24h": sig.change_24h, "volume_24h": sig.volume_24h,
         "entry": sig.entry, "sl": sig.sl, "tp1": sig.tp1, "tp2": sig.tp2, "tp3": sig.tp3,
         "sl_pct": sig.sl_pct, "atr": sig.atr, "mode": sig.mode.value,
+        "direction": getattr(sig, 'direction', 'long'),
         "verdicts_detail": [
             {"name": v.name, "score": v.score, "confidence": v.confidence,
              "reasons": v.reasons, "warnings": v.warnings}
@@ -257,12 +258,72 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
                 # ─── Trailing manager check (TP1/TP2/TP3 + trailing SL) ──
                 try:
                     from trading.trail_manager import trail_mgr
-                    df = await binance.fetch_klines(sym, "5m", 2)
+                    df = await binance.fetch_klines(sym, "5m", 50)
                     if df is not None and len(df) > 0:
                         current = float(df["c"].iloc[-1])
                         # Auto-start trailing if not yet tracked
                         if trail_mgr.get(chat_id, sym) is None:
-                            trail_mgr.start_tracking(chat_id, sym, trade, "long")
+                            direction = getattr(trade, 'direction', 'long')
+                            trail_mgr.start_tracking(chat_id, sym, trade, direction)
+
+                        # ─── Exhaustion check (defensive SL move) ──
+                        try:
+                            from scorer.exhaustion import (
+                                analyze_exhaustion, render_exhaustion_alert,
+                            )
+                            funding_data = None
+                            try:
+                                fr = await binance.fetch_funding_rate(sym)
+                                if fr:
+                                    funding_data = fr.get("funding_rate")
+                            except Exception:
+                                pass
+
+                            exhaustion = analyze_exhaustion(
+                                df_5m=df, funding_rate=funding_data
+                            )
+                            ts = trail_mgr.get(chat_id, sym)
+
+                            # If exhaustion against our position → defensive action
+                            our_dir = getattr(trade, 'direction', 'long')
+                            if (our_dir == "long"
+                                and exhaustion.direction == "buying_exhaustion"
+                                and exhaustion.signals_count >= 2):
+                                # User chose: move SL to BE defensively
+                                if ts and ts.current_sl < ts.initial_entry:
+                                    old_sl = ts.current_sl
+                                    ts.current_sl = ts.initial_entry
+                                    msg = render_exhaustion_alert(exhaustion, sym, current)
+                                    msg += (f"\n\n🛡 *إجراء دفاعي تلقائي:*\n"
+                                            f"تم تحريك SL إلى Break-Even\n"
+                                            f"`${old_sl:.6g}` → `${ts.current_sl:.6g}`")
+                                    try:
+                                        await bot.send_message(
+                                            chat_id=chat_id, text=msg,
+                                            parse_mode="Markdown",
+                                        )
+                                    except Exception as e:
+                                        log.warning("exhaustion_alert_err", err=str(e))
+                            elif (our_dir == "short"
+                                  and exhaustion.direction == "selling_exhaustion"
+                                  and exhaustion.signals_count >= 2):
+                                if ts and ts.current_sl > ts.initial_entry:
+                                    old_sl = ts.current_sl
+                                    ts.current_sl = ts.initial_entry
+                                    msg = render_exhaustion_alert(exhaustion, sym, current)
+                                    msg += (f"\n\n🛡 *إجراء دفاعي تلقائي:*\n"
+                                            f"تم تحريك SL إلى Break-Even\n"
+                                            f"`${old_sl:.6g}` → `${ts.current_sl:.6g}`")
+                                    try:
+                                        await bot.send_message(
+                                            chat_id=chat_id, text=msg,
+                                            parse_mode="Markdown",
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            log.debug("exhaustion_check_err", err=str(e))
+
                         result = trail_mgr.update(chat_id, sym, current)
                         for action in result.get("actions", []):
                             try:
@@ -274,7 +335,6 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
                             except Exception as e:
                                 log.warning("trail_msg_error", err=str(e))
                             if action.get("close"):
-                                # Record close + cleanup
                                 try:
                                     from trading.manager import record_trade_close
                                     reason = ("SL" if action["type"] == "sl_hit"
@@ -285,7 +345,7 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
                                 trail_mgr.stop_tracking(chat_id, sym)
                                 await state.remove_trade(chat_id, sym)
                         if result.get("should_stop"):
-                            continue  # don't run analyze_exit on closed trades
+                            continue
                 except Exception as e:
                     log.warning("trail_update_error", sym=sym, err=str(e))
 
