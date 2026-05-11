@@ -823,6 +823,156 @@ def _apply_hard_gate(sig: Signal, snap: MarketSnapshot, direction: str):
         except Exception:
             pass
 
+    # ─── Gate 21: HTF Bear/Bull Market Filter ──
+    # If the coin is in a strong daily downtrend, the bounce we're seeing
+    # is likely a bear market rally — not a real LONG opportunity.
+    df_1d = snap.klines_1d
+    if df_1d is not None and len(df_1d) >= 30:
+        try:
+            from scorer.trend_maturity import calculate_ema, calculate_rsi
+            closes_1d = df_1d["c"].astype(float)
+            ema21_1d = calculate_ema(closes_1d, 21)
+            ema50_1d = calculate_ema(closes_1d, 50)
+            current_d = float(closes_1d.iloc[-1])
+
+            # Distance below EMA21
+            below_ema21_pct = (ema21_1d - current_d) / ema21_1d * 100 if ema21_1d > 0 else 0
+            ema21_below_ema50 = ema21_1d < ema50_1d
+            # Daily RSI
+            rsi_1d = calculate_rsi(closes_1d, 14)
+
+            # LONG block: in clear daily downtrend
+            if direction == "long":
+                # Strong bear market = price > 8% below EMA21 + EMA21 below EMA50 + RSI < 50
+                if below_ema21_pct > 8 and ema21_below_ema50 and rsi_1d < 50:
+                    # Check recent move — is this just a small bounce?
+                    bounce_pct = snap.change_24h
+                    if bounce_pct < 10:  # not a real breakout
+                        rejections.append(
+                            f"عملة في downtrend يومي (-{below_ema21_pct:.1f}% تحت EMA21, "
+                            f"RSI {rsi_1d:.0f}) — الارتداد ضعيف، ليس انعكاس"
+                        )
+                # Less strict: just clearly below
+                elif below_ema21_pct > 12 and ema21_below_ema50:
+                    rejections.append(
+                        f"عملة بعيدة عن EMA21 اليومي (-{below_ema21_pct:.1f}%) — "
+                        f"الترند يومي هابط"
+                    )
+            else:  # short
+                # Bull market = strong daily uptrend, blocks SHORT
+                above_ema21_pct = (current_d - ema21_1d) / ema21_1d * 100 if ema21_1d > 0 else 0
+                ema21_above_ema50 = ema21_1d > ema50_1d
+                if above_ema21_pct > 8 and ema21_above_ema50 and rsi_1d > 50:
+                    drop_pct = snap.change_24h
+                    if drop_pct > -10:
+                        rejections.append(
+                            f"عملة في uptrend يومي (+{above_ema21_pct:.1f}% فوق EMA21, "
+                            f"RSI {rsi_1d:.0f}) — الهبوط ضعيف، ليس انعكاس"
+                        )
+        except Exception as e:
+            log.debug("gate21_htf_err", err=str(e))
+
+    # ─── Gate 22: Recent Wick Rejection (1h timeframe) ──
+    # Look at last 8 hours of 1h candles. If any had a big upper wick
+    # (for LONG) or lower wick (for SHORT), that's a recent rejection
+    # signal — don't enter same direction.
+    df_1h = snap.klines_1h
+    if df_1h is not None and len(df_1h) >= 8:
+        try:
+            recent_8h = df_1h.tail(8)
+            atr_1h = 0.0
+            try:
+                from scorer.smart_sl import _calculate_atr_for_timeframe
+                atr_1h = _calculate_atr_for_timeframe(df_1h, 14)
+            except Exception:
+                pass
+
+            worst_rejection = None
+            for idx in range(len(recent_8h)):
+                bar = recent_8h.iloc[idx]
+                o = float(bar["o"])
+                h = float(bar["h"])
+                l = float(bar["l"])
+                c = float(bar["c"])
+                rng = h - l
+                if rng <= 0:
+                    continue
+
+                upper_wick = h - max(o, c)
+                lower_wick = min(o, c) - l
+
+                if direction == "long":
+                    upper_pct = (upper_wick / snap.price) * 100
+                    wick_ratio = upper_wick / rng
+                    # Big upper wick (>2% of price) + wick > 50% of candle
+                    if upper_pct > 2.0 and wick_ratio > 0.5:
+                        bars_ago = len(recent_8h) - 1 - idx
+                        if (worst_rejection is None or
+                            upper_pct > worst_rejection["pct"]):
+                            worst_rejection = {
+                                "pct": upper_pct, "wick_ratio": wick_ratio,
+                                "price": h, "bars_ago": bars_ago,
+                            }
+                else:  # short
+                    lower_pct = (lower_wick / snap.price) * 100
+                    wick_ratio = lower_wick / rng
+                    if lower_pct > 2.0 and wick_ratio > 0.5:
+                        bars_ago = len(recent_8h) - 1 - idx
+                        if (worst_rejection is None or
+                            lower_pct > worst_rejection["pct"]):
+                            worst_rejection = {
+                                "pct": lower_pct, "wick_ratio": wick_ratio,
+                                "price": l, "bars_ago": bars_ago,
+                            }
+
+            if worst_rejection and worst_rejection["pct"] > 2.5:
+                rejection_type = "علوي" if direction == "long" else "سفلي"
+                rejections.append(
+                    f"رفض فتيل {rejection_type} قبل {worst_rejection['bars_ago']}س "
+                    f"عند ${worst_rejection['price']:.6g} "
+                    f"(-{worst_rejection['pct']:.1f}% wick)"
+                )
+        except Exception as e:
+            log.debug("gate22_wick_err", err=str(e))
+
+    # ─── Gate 23: Bounce vs Breakout classifier ──
+    # If price is just bouncing inside a range (not breaking out),
+    # the move is short-lived. Reject "fake breakout" signals.
+    if df_1h is not None and len(df_1h) >= 30:
+        try:
+            recent_30h = df_1h.tail(30)
+            range_high = float(recent_30h["h"].astype(float).max())
+            range_low = float(recent_30h["l"].astype(float).min())
+            range_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 0
+
+            # Position within range (0 = at low, 100 = at high)
+            position_pct = ((snap.price - range_low) / (range_high - range_low) * 100
+                            if (range_high - range_low) > 0 else 50)
+
+            if range_pct > 3:  # meaningful range
+                if direction == "long":
+                    # If we're in the middle of the range with no breakout — fake long
+                    if 30 < position_pct < 70:
+                        # Check if signal claims pre-explosion
+                        pre_v = next((v for v in sig.verdicts if v.name == "pre_explosion"),
+                                      None)
+                        if pre_v and pre_v.score >= 70:
+                            rejections.append(
+                                f"السعر في منتصف range الـ 30h "
+                                f"(position {position_pct:.0f}%) — ليس breakout"
+                            )
+                else:  # short
+                    if 30 < position_pct < 70:
+                        pre_v = next((v for v in sig.verdicts if v.name == "pre_explosion"),
+                                      None)
+                        if pre_v and pre_v.score >= 70:
+                            rejections.append(
+                                f"السعر في منتصف range الـ 30h "
+                                f"(position {position_pct:.0f}%) — ليس breakdown"
+                            )
+        except Exception as e:
+            log.debug("gate23_range_err", err=str(e))
+
     # ─── Apply rejection ─────────────────────────────────
     if rejections:
         sig.phase = Phase.REJECTED
@@ -869,6 +1019,7 @@ def _attach_tp_sl(sig: Signal, snap: MarketSnapshot, mode: Mode, direction: str 
         order_book=snap.order_book or {},
         direction=direction,
         mode=mode.value,
+        snap=snap,    # NEW: enables smart SL adjustments
     )
 
     sig.entry = plan.entry

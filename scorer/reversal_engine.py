@@ -58,7 +58,13 @@ class ReversalReport:
 
     @property
     def is_strong_reversal(self) -> bool:
-        return self.confirms_count >= 2 and self.total_strength >= 50
+        # More sensitive — catch reversals earlier
+        # Either: 2+ confirms with moderate strength, OR 1 strong confirm
+        if self.confirms_count >= 2 and self.total_strength >= 40:
+            return True
+        if self.confirms_count >= 1 and self.total_strength >= 65:
+            return True
+        return False
 
     @property
     def is_extreme_reversal(self) -> bool:

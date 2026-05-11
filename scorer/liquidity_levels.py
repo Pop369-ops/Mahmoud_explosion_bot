@@ -162,7 +162,7 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
-                     mode: str = "day") -> LiquidityPlan:
+                     mode: str = "day", snap=None) -> LiquidityPlan:
     atr = compute_atr(df) or price * 0.005
 
     # ─── Increased buffers to protect from stop hunts ──
@@ -287,6 +287,25 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
         sl_dist = price - sl
         warnings.append(f"⚠️ SL تم تقييده عند -{sl_max_pct}%")
 
+    # ═══ SMART SL ADJUSTMENTS ═══
+    # Apply 5 layers of safety: volatility, equal lows, psychological, HTF, bounds
+    if snap is not None:
+        try:
+            from scorer.smart_sl import apply_smart_sl_adjustments
+            sl_decision = apply_smart_sl_adjustments(
+                initial_sl=sl, initial_method=method, initial_logic=sl_logic,
+                snap=snap, direction="long", mode=mode, atr=atr, df=df,
+            )
+            sl = sl_decision.sl_price
+            method = sl_decision.method
+            # Append smart adjustments to logic
+            if sl_decision.safety_adjustments:
+                sl_logic = sl_logic + " | " + " ؛ ".join(sl_decision.safety_adjustments)
+            warnings.extend(sl_decision.warnings)
+            sl_dist = price - sl
+        except Exception as e:
+            log.debug("smart_sl_err", err=str(e))
+
     # ═══ TP ═══
     tp_targets: list = []
     for fvg in fvgs_above:
@@ -354,7 +373,7 @@ def build_long_plan(price: float, df: pd.DataFrame, order_book: dict,
 # ═══════════════════════════════════════════════════════════════
 
 def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
-                      mode: str = "day") -> LiquidityPlan:
+                      mode: str = "day", snap=None) -> LiquidityPlan:
     atr = compute_atr(df) or price * 0.005
 
     # ─── Increased buffers to protect from stop hunts ──
@@ -468,6 +487,23 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
         sl_dist = sl - price
         warnings.append(f"⚠️ SL تم تقييده عند +{sl_max_pct}%")
 
+    # ═══ SMART SL ADJUSTMENTS ═══
+    if snap is not None:
+        try:
+            from scorer.smart_sl import apply_smart_sl_adjustments
+            sl_decision = apply_smart_sl_adjustments(
+                initial_sl=sl, initial_method=method, initial_logic=sl_logic,
+                snap=snap, direction="short", mode=mode, atr=atr, df=df,
+            )
+            sl = sl_decision.sl_price
+            method = sl_decision.method
+            if sl_decision.safety_adjustments:
+                sl_logic = sl_logic + " | " + " ؛ ".join(sl_decision.safety_adjustments)
+            warnings.extend(sl_decision.warnings)
+            sl_dist = sl - price
+        except Exception as e:
+            log.debug("smart_sl_err", err=str(e))
+
     tp_targets: list = []
     for fvg in fvgs_below:
         tp_price = fvg.top - (fvg.top - fvg.bottom) * 0.3
@@ -530,11 +566,12 @@ def build_short_plan(price: float, df: pd.DataFrame, order_book: dict,
 
 
 def build_plan(price: float, df: pd.DataFrame, order_book: dict,
-                direction: str = "long", mode: str = "day") -> LiquidityPlan:
+                direction: str = "long", mode: str = "day",
+                snap=None) -> LiquidityPlan:
     try:
         if direction == "short":
-            return build_short_plan(price, df, order_book, mode)
-        return build_long_plan(price, df, order_book, mode)
+            return build_short_plan(price, df, order_book, mode, snap=snap)
+        return build_long_plan(price, df, order_book, mode, snap=snap)
     except Exception as e:
         log.warning("liquidity_plan_error", err=str(e))
         atr = compute_atr(df) or price * 0.005

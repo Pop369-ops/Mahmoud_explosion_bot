@@ -324,6 +324,110 @@ async def monitor_trades_callback(c: ContextTypes.DEFAULT_TYPE):
                         except Exception as e:
                             log.debug("exhaustion_check_err", err=str(e))
 
+                        # ─── SL Proximity Warning (Phase C real-time defense) ──
+                        # Warn user when price approaches SL within 0.5% — before it hits
+                        try:
+                            our_dir = getattr(trade, 'direction', 'long')
+                            ts_check = trail_mgr.get(chat_id, sym)
+                            if ts_check:
+                                sl_now = ts_check.current_sl
+                                proximity_threshold_pct = 0.7  # warn when within 0.7%
+                                if our_dir == "long" and current > sl_now:
+                                    dist_to_sl_pct = (current - sl_now) / current * 100
+                                    if dist_to_sl_pct <= proximity_threshold_pct:
+                                        # Use cooldown to avoid spam
+                                        prox_key = f"sl_prox_{chat_id}_{sym}"
+                                        if not state.in_cooldown(chat_id, prox_key, 300):
+                                            state.mark_alerted(chat_id, prox_key)
+                                            await bot.send_message(
+                                                chat_id=chat_id,
+                                                text=(f"🚨 *تحذير قرب SL — {sym}*\n\n"
+                                                        f"السعر `${current:.6g}` قريب جداً من SL `${sl_now:.6g}` "
+                                                        f"({dist_to_sl_pct:.2f}% فقط)\n\n"
+                                                        f"⚠️ راقب الصفقة عن كثب — أو أغلق يدوياً لو في إشارة انعكاس."),
+                                                parse_mode="Markdown",
+                                            )
+                                elif our_dir == "short" and current < sl_now:
+                                    dist_to_sl_pct = (sl_now - current) / current * 100
+                                    if dist_to_sl_pct <= proximity_threshold_pct:
+                                        prox_key = f"sl_prox_{chat_id}_{sym}"
+                                        if not state.in_cooldown(chat_id, prox_key, 300):
+                                            state.mark_alerted(chat_id, prox_key)
+                                            await bot.send_message(
+                                                chat_id=chat_id,
+                                                text=(f"🚨 *تحذير قرب SL — {sym}*\n\n"
+                                                        f"السعر `${current:.6g}` قريب جداً من SL `${sl_now:.6g}` "
+                                                        f"({dist_to_sl_pct:.2f}% فقط)\n\n"
+                                                        f"⚠️ راقب الصفقة عن كثب."),
+                                                parse_mode="Markdown",
+                                            )
+                        except Exception as e:
+                            log.debug("sl_proximity_err", err=str(e))
+
+                        # ─── Wick rejection on 1m candles (Phase C) ──
+                        # If a 1m candle shows huge wick against our trade direction,
+                        # tighten SL proactively to lock minimum loss
+                        try:
+                            our_dir = getattr(trade, 'direction', 'long')
+                            df_1m = await binance.fetch_klines(sym, "1m", 10)
+                            if df_1m is not None and len(df_1m) >= 5:
+                                last = df_1m.iloc[-1]
+                                o = float(last["o"])
+                                h = float(last["h"])
+                                l = float(last["l"])
+                                c = float(last["c"])
+                                rng = h - l
+                                if rng > 0:
+                                    upper_wick = h - max(o, c)
+                                    lower_wick = min(o, c) - l
+                                    upper_pct = upper_wick / rng
+                                    lower_pct = lower_wick / rng
+                                    upper_wick_price_pct = upper_wick / current * 100
+                                    lower_wick_price_pct = lower_wick / current * 100
+
+                                    ts_now = trail_mgr.get(chat_id, sym)
+                                    if ts_now and not getattr(ts_now, "wick_defended", False):
+                                        # LONG: big upper wick = sellers stepping in
+                                        if (our_dir == "long" and upper_pct > 0.55
+                                            and upper_wick_price_pct > 0.3
+                                            and current >= trade.entry * 1.005):
+                                            # Move SL toward entry to lock in small profit
+                                            new_sl = max(ts_now.current_sl, trade.entry)
+                                            if new_sl > ts_now.current_sl:
+                                                ts_now.current_sl = new_sl
+                                                ts_now.wick_defended = True
+                                                try:
+                                                    await bot.send_message(
+                                                        chat_id=chat_id,
+                                                        text=(f"⚡ *دفاع فوري — {sym}*\n\n"
+                                                              f"فتيل علوي قوي على شمعة 1m "
+                                                              f"(-{upper_wick_price_pct:.2f}% من القمة)\n"
+                                                              f"🛡 تم تحريك SL إلى Break-Even لحماية الأرباح"),
+                                                        parse_mode="Markdown",
+                                                    )
+                                                except Exception:
+                                                    pass
+                                        elif (our_dir == "short" and lower_pct > 0.55
+                                              and lower_wick_price_pct > 0.3
+                                              and current <= trade.entry * 0.995):
+                                            new_sl = min(ts_now.current_sl, trade.entry)
+                                            if new_sl < ts_now.current_sl:
+                                                ts_now.current_sl = new_sl
+                                                ts_now.wick_defended = True
+                                                try:
+                                                    await bot.send_message(
+                                                        chat_id=chat_id,
+                                                        text=(f"⚡ *دفاع فوري — {sym}*\n\n"
+                                                              f"فتيل سفلي قوي على شمعة 1m "
+                                                              f"(+{lower_wick_price_pct:.2f}% من القاع)\n"
+                                                              f"🛡 تم تحريك SL إلى Break-Even لحماية الأرباح"),
+                                                        parse_mode="Markdown",
+                                                    )
+                                                except Exception:
+                                                    pass
+                        except Exception as e:
+                            log.debug("wick_defense_err", err=str(e))
+
                         result = trail_mgr.update(chat_id, sym, current)
                         for action in result.get("actions", []):
                             try:
