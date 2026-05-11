@@ -853,3 +853,69 @@ async def cmd_check_reversal(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(m, parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
+
+
+# ───────────────────────────────────────────────────────────────
+# PERFORMANCE TRACKING COMMANDS
+# ───────────────────────────────────────────────────────────────
+async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Quick performance summary: today / week / month."""
+    from risk.advanced_tracker import advanced_tracker
+    from risk.performance_reports import build_quick_stats
+
+    if advanced_tracker is None:
+        await u.message.reply_text(
+            "⚠️ نظام التتبع المتقدم لم يُهيأ بعد. أعد تشغيل البوت."
+        )
+        return
+
+    chat_id = u.effective_chat.id
+    msg = await u.message.reply_text("📊 جاري تجميع الإحصائيات...")
+    try:
+        text = await build_quick_stats(advanced_tracker, chat_id)
+        await msg.edit_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def cmd_report(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Full 7-day performance report."""
+    from risk.advanced_tracker import advanced_tracker
+    from risk.performance_reports import build_weekly_report
+
+    if advanced_tracker is None:
+        await u.message.reply_text("⚠️ نظام التتبع غير مُهيأ.")
+        return
+
+    chat_id = u.effective_chat.id
+    msg = await u.message.reply_text("📊 جاري إعداد التقرير الأسبوعي...")
+    try:
+        text = await build_weekly_report(advanced_tracker, chat_id)
+        # Telegram message limit is 4096 chars
+        if len(text) > 4000:
+            # Split into 2 messages
+            mid = text.rfind("\n", 0, 4000)
+            await msg.edit_text(text[:mid], parse_mode="Markdown")
+            await u.message.reply_text(text[mid:], parse_mode="Markdown")
+        else:
+            await msg.edit_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def cmd_recommendations(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Generate actionable recommendations based on tracked data."""
+    from risk.advanced_tracker import advanced_tracker
+    from risk.performance_reports import build_recommendations
+
+    if advanced_tracker is None:
+        await u.message.reply_text("⚠️ نظام التتبع غير مُهيأ.")
+        return
+
+    chat_id = u.effective_chat.id
+    msg = await u.message.reply_text("💡 جاري توليد التوصيات...")
+    try:
+        text = await build_recommendations(advanced_tracker, chat_id)
+        await msg.edit_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")

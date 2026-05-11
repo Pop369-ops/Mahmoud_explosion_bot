@@ -179,6 +179,21 @@ async def scan_watch_list_for_awakening(
                 log.info("awakening_sent", symbol=alert.symbol,
                           score=alert.awakening_score,
                           signals=alert.signals_fired)
+                # ─── ADVANCED TRACKING ──
+                try:
+                    from risk.advanced_tracker import advanced_tracker, TierBRecord
+                    if advanced_tracker is not None:
+                        rec = TierBRecord(
+                            chat_id=chat_id, symbol=alert.symbol,
+                            alert_type="awakening",
+                            direction=alert.direction,
+                            score=alert.awakening_score,
+                            signals_fired=alert.signals_fired,
+                            price_at_alert=alert.price,
+                        )
+                        await advanced_tracker.log_tier_b(rec)
+                except Exception as e:
+                    log.debug("track_tier_b_err", err=str(e))
             except Exception as e:
                 log.warning("awaken_send_err", symbol=alert.symbol, err=str(e))
 

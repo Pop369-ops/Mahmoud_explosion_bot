@@ -310,6 +310,21 @@ async def scan_for_reversals(chat_id: int, bot: Bot,
                 )
                 log.info("reversal_sent", symbol=alert.symbol,
                           dir=alert.direction, strength=alert.strength)
+                # ─── ADVANCED TRACKING ──
+                try:
+                    from risk.advanced_tracker import advanced_tracker, TierBRecord
+                    if advanced_tracker is not None:
+                        rec = TierBRecord(
+                            chat_id=chat_id, symbol=alert.symbol,
+                            alert_type="reversal",
+                            direction=alert.direction,
+                            score=alert.strength,
+                            signals_fired=alert.confirms,
+                            price_at_alert=alert.price,
+                        )
+                        await advanced_tracker.log_tier_b(rec)
+                except Exception as e:
+                    log.debug("track_tier_b_err", err=str(e))
             except Exception as e:
                 log.warning("reversal_send_err",
                               symbol=alert.symbol, err=str(e))

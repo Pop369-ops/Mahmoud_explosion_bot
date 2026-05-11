@@ -207,6 +207,82 @@ async def _dispatch_alert(chat_id: int, sig: Signal, snap: MarketSnapshot, bot: 
                 parse_mode="Markdown",
             )
             state.mark_capital_reminded(chat_id)
+
+        # ─── ADVANCED TRACKING: log this signal ──
+        try:
+            from risk.advanced_tracker import advanced_tracker, SignalRecord
+            import json
+            if advanced_tracker is not None:
+                # Extract context
+                rsi_1h = rsi_4h = rsi_1d = 0.0
+                try:
+                    from scorer.trend_maturity import analyze_trend_maturity
+                    maturity = analyze_trend_maturity(snap)
+                    rsi_1h, rsi_4h, rsi_1d = maturity.rsi_1h, maturity.rsi_4h, maturity.rsi_1d
+                except Exception:
+                    pass
+
+                # Killzone
+                kz_name = "none"
+                try:
+                    if snap.killzone is not None:
+                        kz_name = getattr(snap.killzone, "active_zone", "none") or "none"
+                except Exception:
+                    pass
+
+                # BTC trend score
+                btc_score = 50
+                for v in sig.verdicts:
+                    if v.name == "btc_trend":
+                        btc_score = v.score
+                        break
+
+                # Verdicts JSON
+                verdicts_dict = {v.name: v.score for v in sig.verdicts}
+
+                # SL method
+                sl_method = "unknown"
+                sl_adjustments = ""
+                for w in sig.warnings:
+                    if "Equal Lows" in w or "Equal Highs" in w:
+                        sl_adjustments += "eq_levels;"
+                    if "volatility" in w.lower():
+                        sl_adjustments += "vol_floor;"
+                    if "HTF" in w or "swing high" in w or "swing low" in w:
+                        sl_adjustments += "htf;"
+
+                # Determine market regime
+                regime = "ranging"
+                if rsi_1d > 60:
+                    regime = "uptrend"
+                elif rsi_1d < 40:
+                    regime = "downtrend"
+
+                rec = SignalRecord(
+                    chat_id=chat_id, symbol=sig.symbol,
+                    direction=getattr(sig, 'direction', 'long'),
+                    phase=sig.phase.value, confidence=sig.confidence,
+                    sources_agreed=sig.sources_agreed,
+                    sources_total=sig.sources_total,
+                    entry=sig.entry, sl=sig.sl,
+                    tp1=sig.tp1, tp2=sig.tp2, tp3=sig.tp3,
+                    sl_pct=sig.sl_pct,
+                    sl_method=sl_method,
+                    sl_adjustments=sl_adjustments,
+                    verdicts_json=json.dumps(verdicts_dict),
+                    rejected=False, rejection_reason="",
+                    gates_passed="1-23",
+                    gates_failed="",
+                    change_24h=sig.change_24h,
+                    rsi_1h=rsi_1h, rsi_4h=rsi_4h, rsi_1d=rsi_1d,
+                    in_killzone=kz_name,
+                    btc_trend_score=btc_score,
+                    market_regime=regime,
+                )
+                await advanced_tracker.log_signal(rec)
+        except Exception as e:
+            log.debug("track_signal_err", err=str(e))
+
     except Exception as e:
         log.warning("alert_send_error", err=str(e), symbol=sig.symbol)
 
@@ -553,6 +629,50 @@ async def reversal_scan_callback(c: ContextTypes.DEFAULT_TYPE):
         log.warning("reversal_scan_err", err=str(e))
 
 
+async def tier_b_validator_callback(c: ContextTypes.DEFAULT_TYPE):
+    """Validate Tier B alerts after 1h and 4h. Runs every 15 minutes."""
+    try:
+        from risk.advanced_tracker import advanced_tracker
+        if advanced_tracker is None:
+            return
+
+        import aiosqlite
+        from config.settings import settings
+        from data_sources.binance import binance
+        from datetime import datetime, timedelta
+        from core.models import now_riyadh
+
+        now = now_riyadh()
+
+        # Find alerts that need validation
+        async with aiosqlite.connect(settings.db_path) as db:
+            cursor = await db.execute("""
+                SELECT id, symbol, sent_at FROM tier_b_log
+                WHERE validated_at IS NULL
+                  AND sent_at >= ?
+            """, ((now - timedelta(hours=8)).isoformat(),))
+            rows = await cursor.fetchall()
+
+        for row in rows:
+            alert_id, symbol, sent_at_str = row
+            try:
+                sent_at = datetime.fromisoformat(sent_at_str)
+                hours_passed = (now - sent_at).total_seconds() / 3600
+
+                # Validate at ~1h and ~4h marks
+                if 0.9 <= hours_passed <= 1.3 or 3.5 <= hours_passed <= 4.5:
+                    df = await binance.fetch_klines(symbol, "1m", 5)
+                    if df is not None and len(df) > 0:
+                        current_price = float(df["c"].iloc[-1])
+                        await advanced_tracker.validate_tier_b(
+                            alert_id, current_price, hours_passed,
+                        )
+            except Exception as e:
+                log.debug("validate_one_err", err=str(e))
+    except Exception as e:
+        log.warning("tier_b_validator_err", err=str(e))
+
+
 def start_awakening_system(application):
     """Schedule both watch list refresh and awakening scan jobs."""
     # Watch list refresh: every 5 minutes, first run after 60 seconds
@@ -576,6 +696,14 @@ def start_awakening_system(application):
         first=120,
         name="reversal_scan",
     )
+    # Tier B validator: every 15 minutes, first run after 60 minutes
+    application.job_queue.run_repeating(
+        tier_b_validator_callback,
+        interval=900,    # 15 min
+        first=3600,      # wait 1 hour before first validation
+        name="tier_b_validator",
+    )
     log.info("awakening_system_started",
-              watch_interval=300, scan_interval=30, reversal_interval=60)
+              watch_interval=300, scan_interval=30, reversal_interval=60,
+              validator_interval=900)
 

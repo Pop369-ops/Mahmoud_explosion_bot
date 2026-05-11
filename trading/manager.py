@@ -27,8 +27,13 @@ async def record_trade_close(chat_id: int, trade: Trade,
                                 exit_price: float, close_reason: str):
     """Persist closed trade to performance log + update risk state."""
     pnl_pct = (exit_price - trade.entry) / trade.entry * 100 if trade.entry > 0 else 0
+    direction = getattr(trade, "direction", "long")
+    # For short, invert PnL
+    if direction == "short":
+        pnl_pct = -pnl_pct
+
     sl_dist = abs(trade.entry - trade.sl)
-    pnl_r = (exit_price - trade.entry) / sl_dist if sl_dist > 0 else 0
+    pnl_r = pnl_pct / (sl_dist / trade.entry * 100) if (sl_dist > 0 and trade.entry > 0) else 0
 
     # Duration
     duration = int((now_riyadh() - trade.opened_at).total_seconds() / 60)
@@ -40,7 +45,7 @@ async def record_trade_close(chat_id: int, trade: Trade,
     except Exception:
         pass
 
-    # Persist to performance log
+    # Persist to performance log (legacy)
     try:
         from risk.performance import PerformanceTracker, TradeRecord
         from config.settings import settings
@@ -48,7 +53,7 @@ async def record_trade_close(chat_id: int, trade: Trade,
         await tracker.init()
         rec = TradeRecord(
             chat_id=chat_id, symbol=trade.symbol,
-            direction="long",  # bot is long-only for now
+            direction=direction,
             setup_type=getattr(trade, "setup_type", "unknown"),
             entry=trade.entry, sl=trade.sl, tp1=trade.tp1,
             exit_price=exit_price,
@@ -63,6 +68,44 @@ async def record_trade_close(chat_id: int, trade: Trade,
         await tracker.record(rec)
     except Exception:
         pass
+
+    # ─── ADVANCED TRACKING: update outcome ──
+    try:
+        from risk.advanced_tracker import advanced_tracker
+        if advanced_tracker is not None:
+            # Find the open signal for this symbol
+            signal_id = await advanced_tracker.find_open_signal(
+                chat_id, trade.symbol
+            )
+            if signal_id:
+                # Determine outcome category
+                if pnl_pct > 0:
+                    if close_reason in ("TP1", "tp1_hit"):
+                        outcome = "win_tp1"
+                    elif close_reason in ("TP2", "tp2_hit"):
+                        outcome = "win_tp2"
+                    elif close_reason in ("TP3", "tp3_hit"):
+                        outcome = "win_tp3"
+                    elif "trailing" in close_reason.lower():
+                        outcome = "win_trailing"
+                    else:
+                        outcome = "win_other"
+                else:
+                    if close_reason in ("SL", "sl_hit", "exit_sl"):
+                        outcome = "loss_sl"
+                    else:
+                        outcome = "loss_manual"
+
+                await advanced_tracker.update_outcome(
+                    signal_id=signal_id,
+                    outcome=outcome,
+                    actual_pnl_pct=round(pnl_pct, 2),
+                    actual_pnl_r=round(pnl_r, 2),
+                    duration_minutes=duration,
+                )
+    except Exception as e:
+        from core.logger import get_logger
+        get_logger(__name__).debug("advanced_tracker_close_err", err=str(e))
 
 
 async def analyze_exit(trade: Trade) -> dict:

@@ -44,6 +44,15 @@ async def _post_init(app):
     except Exception as e:
         log.warning("perf_init_error", err=str(e))
 
+    # Init ADVANCED performance tracker (per-gate, per-detector analytics)
+    try:
+        from risk.advanced_tracker import init_advanced_tracker
+        adv_tracker = init_advanced_tracker(settings.db_path)
+        await adv_tracker.init()
+        log.info("advanced_tracker_initialized")
+    except Exception as e:
+        log.warning("advanced_tracker_init_err", err=str(e))
+
     # Confirm Binance connection
     try:
         pairs = await binance.fetch_top_pairs(top_n=5, min_vol_usd=1_000_000)
@@ -121,6 +130,7 @@ def main():
         cmd_awaken_off, cmd_awaken_on,
         cmd_reversal, cmd_reversal_now, cmd_reversal_threshold,
         cmd_reversal_off, cmd_reversal_on, cmd_check_reversal,
+        cmd_stats, cmd_report, cmd_recommendations,
     )
     from ui.callback_handlers import handle_callback
 
@@ -169,6 +179,10 @@ def main():
     app.add_handler(CommandHandler("reversal_off", cmd_reversal_off))
     app.add_handler(CommandHandler("reversal_on", cmd_reversal_on))
     app.add_handler(CommandHandler("check_reversal", cmd_check_reversal))
+    # Performance tracking & analytics
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("recommendations", cmd_recommendations))
 
     # Callbacks (inline buttons)
     app.add_handler(CallbackQueryHandler(handle_callback))
