@@ -20,18 +20,51 @@ log = get_logger(__name__)
 # ────────────────────────────────────────────────────────────
 async def build_weekly_report(tracker: AdvancedTracker, chat_id: int) -> str:
     """Build a comprehensive 7-day performance report."""
-    overall = await tracker.get_overall_summary(chat_id, days=7)
+    import asyncio
+
+    try:
+        overall = await asyncio.wait_for(
+            tracker.get_overall_summary(chat_id, days=7), timeout=8.0
+        )
+    except asyncio.TimeoutError:
+        return ("⚠️ *قاعدة البيانات بطيئة الاستجابة*\n\n"
+                "حاول مرة أخرى خلال دقيقة.")
+    except Exception as e:
+        return f"❌ خطأ في قاعدة البيانات: {e}"
+
     if not overall or overall.get("total_signals", 0) == 0:
         return ("📊 *تقرير الأسبوع*\n\n"
-                "لا توجد بيانات كافية بعد.\n"
-                "البوت يحتاج أسبوعاً على الأقل من العمل ليجمع بيانات.")
+                "لا توجد بيانات كافية بعد.\n\n"
+                "البوت بدأ تجميع البيانات الآن.\n"
+                "ستحتاج 5+ صفقات مغلقة على الأقل قبل أن يكون التقرير مفيداً.\n\n"
+                "_جرّب /stats للملخص السريع._\n"
+                "_التقرير الكامل يحتاج 24-48 ساعة من العمل النشط._")
 
-    method_stats = await tracker.get_method_stats(chat_id, days=7)
-    killzone_stats = await tracker.get_killzone_stats(chat_id, days=7)
-    direction_stats = await tracker.get_direction_stats(chat_id, days=7)
-    tier_b_stats = await tracker.get_tier_b_accuracy(chat_id, days=7)
-    confidence_buckets = await tracker.get_confidence_buckets(chat_id, days=7)
-    rejections = await tracker.get_rejection_summary(chat_id, days=7)
+    # Parallelize all queries to speed up report generation
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                tracker.get_method_stats(chat_id, days=7),
+                tracker.get_killzone_stats(chat_id, days=7),
+                tracker.get_direction_stats(chat_id, days=7),
+                tracker.get_tier_b_accuracy(chat_id, days=7),
+                tracker.get_confidence_buckets(chat_id, days=7),
+                tracker.get_rejection_summary(chat_id, days=7),
+                return_exceptions=True,
+            ),
+            timeout=15.0,
+        )
+        method_stats = results[0] if not isinstance(results[0], Exception) else []
+        killzone_stats = results[1] if not isinstance(results[1], Exception) else {}
+        direction_stats = results[2] if not isinstance(results[2], Exception) else {}
+        tier_b_stats = results[3] if not isinstance(results[3], Exception) else {}
+        confidence_buckets = results[4] if not isinstance(results[4], Exception) else {}
+        rejections = results[5] if not isinstance(results[5], Exception) else {}
+    except asyncio.TimeoutError:
+        return ("⚠️ *تجميع الإحصائيات تأخر*\n\n"
+                "حاول مرة أخرى خلال دقيقة.")
+    except Exception as e:
+        return f"❌ {e}"
 
     msg = "📊 *تقرير الأداء — آخر 7 أيام*\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -130,7 +163,16 @@ async def build_weekly_report(tracker: AdvancedTracker, chat_id: int) -> str:
 
 async def build_recommendations(tracker: AdvancedTracker, chat_id: int) -> str:
     """Generate actionable recommendations based on data."""
-    overall = await tracker.get_overall_summary(chat_id, days=14)
+    import asyncio
+
+    try:
+        overall = await asyncio.wait_for(
+            tracker.get_overall_summary(chat_id, days=14), timeout=8.0
+        )
+    except asyncio.TimeoutError:
+        return "⚠️ قاعدة البيانات بطيئة الاستجابة. حاول مرة أخرى."
+    except Exception as e:
+        return f"❌ {e}"
 
     if not overall or overall.get("closed_count", 0) < 5:
         return ("💡 *التوصيات*\n\n"
@@ -138,11 +180,27 @@ async def build_recommendations(tracker: AdvancedTracker, chat_id: int) -> str:
                 "البيانات الحالية غير كافية.\n\n"
                 "_حاول مرة أخرى بعد أسبوع._")
 
-    method_stats = await tracker.get_method_stats(chat_id, days=14)
-    killzone_stats = await tracker.get_killzone_stats(chat_id, days=14)
-    direction_stats = await tracker.get_direction_stats(chat_id, days=14)
-    confidence_buckets = await tracker.get_confidence_buckets(chat_id, days=14)
-    tier_b_stats = await tracker.get_tier_b_accuracy(chat_id, days=14)
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                tracker.get_method_stats(chat_id, days=14),
+                tracker.get_killzone_stats(chat_id, days=14),
+                tracker.get_direction_stats(chat_id, days=14),
+                tracker.get_confidence_buckets(chat_id, days=14),
+                tracker.get_tier_b_accuracy(chat_id, days=14),
+                return_exceptions=True,
+            ),
+            timeout=15.0,
+        )
+        method_stats = results[0] if not isinstance(results[0], Exception) else []
+        killzone_stats = results[1] if not isinstance(results[1], Exception) else {}
+        direction_stats = results[2] if not isinstance(results[2], Exception) else {}
+        confidence_buckets = results[3] if not isinstance(results[3], Exception) else {}
+        tier_b_stats = results[4] if not isinstance(results[4], Exception) else {}
+    except asyncio.TimeoutError:
+        return "⚠️ تجميع التوصيات تأخر. حاول مرة أخرى."
+    except Exception as e:
+        return f"❌ {e}"
 
     msg = "💡 *توصيات تحسين البوت — بناءً على بياناتك*\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -268,9 +326,24 @@ async def build_recommendations(tracker: AdvancedTracker, chat_id: int) -> str:
 
 async def build_quick_stats(tracker: AdvancedTracker, chat_id: int) -> str:
     """Quick one-line summary for /stats command."""
-    today = await tracker.get_overall_summary(chat_id, days=1)
-    week = await tracker.get_overall_summary(chat_id, days=7)
-    month = await tracker.get_overall_summary(chat_id, days=30)
+    import asyncio
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                tracker.get_overall_summary(chat_id, days=1),
+                tracker.get_overall_summary(chat_id, days=7),
+                tracker.get_overall_summary(chat_id, days=30),
+                return_exceptions=True,
+            ),
+            timeout=10.0,
+        )
+        today = results[0] if not isinstance(results[0], Exception) else {}
+        week = results[1] if not isinstance(results[1], Exception) else {}
+        month = results[2] if not isinstance(results[2], Exception) else {}
+    except asyncio.TimeoutError:
+        return "⚠️ قاعدة البيانات بطيئة. حاول مرة أخرى."
+    except Exception as e:
+        return f"❌ {e}"
 
     msg = "📊 *إحصائيات سريعة*\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
